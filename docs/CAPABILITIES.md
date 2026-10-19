@@ -88,3 +88,39 @@ they live in a separate private overlay for GitHub‑ToS / trademark / phishing�
 - **Capture buffers are bounded** (firmware 8 frames × 256 B; FAP 16 records) — heavy channel load can drop frames; the validator's reject histogram surfaces why a capture is unusable.
 - **Validation is structural**, not cryptographic: it proves a crackable *exchange shape*, not that the MIC authenticates or that the password will fall.
 - `BBH` and similar exploratory commands remain explicitly unverified in firmware.
+
+## Coverage & target-compatibility matrix
+
+Radio behaviour is environment- and target-specific, so this project does not publish blanket
+"works everywhere" claims. The matrix below is the **reproducible coverage template**: fill the
+result columns from your own runs on networks you own / are authorised to test. "Expected" is what
+the design intends; "Observed" is for your logged result (date, firmware version, notes). Leave a
+row blank until you have actually run it — an empty cell is honest; a guessed cell is not.
+
+| Scenario | Band / channel | Expected | Observed (operator) |
+|----------|----------------|----------|---------------------|
+| Dual-band scan sees 5 GHz APs | 5 GHz 36–48 / 149–165 | APs listed with ch/enc/PMF | |
+| Scan sees DFS APs (RX only) | 5 GHz 52–144 | APs listed, no TX | |
+| Handshake capture (WPA2, client present) | 2.4 GHz | M1–M4 pair, `complete=true` | |
+| Handshake capture (WPA2, 5 GHz AP) | 5 GHz 36/149 | M1–M4 pair, `complete=true` | |
+| PMKID clientless (RSN AP, no client) | 2.4 / 5 GHz | PMKID line, target-bound | |
+| Guided audit picks PMKID for PMF-required | any | method=pmkid, refusal if none | |
+| Eviltwin / SoftAP joinable (DHCP+DNS+HTTP) | 2.4 GHz | client gets IP, portal loads | |
+| Eviltwin / SoftAP joinable | 5 GHz 36 / 149 | client gets IP, portal loads | |
+| Off-target handshake rejected | shared channel | other AP's pair NOT counted | |
+| Mode-change / cancel (scan→audit→stop ×N) | n/a | no wedge, FAP stays responsive | |
+| Long run / SD-full behaviour | n/a | failed save surfaced, no false COMPLETE | |
+
+### Reproducing results
+
+1. Build + flash firmware (`firmware-build/build_petrel.sh`, then `flasher/`), install the FAP (`ufbt`).
+2. Run the scenario against **your own** AP/client; for capture rows, pull the artifacts from
+   `/ext/petrel/sessions/<id>/` (`audit.json`, `report.txt`, `hs.pcap` / `pmkid.22000`).
+3. Record firmware version (`IDENT` / `PETREL_FW_VERSION`), FAP version, channel, target security, and
+   the `complete` / `saved` / `counters` fields from `audit.json`.
+4. For crack-through confirmation, run the `.pcap` / `.22000` through hashcat/aircrack **offline** — the
+   device never cracks and never claims a password.
+
+Rows that need third-party RF (joinable-AP end-to-end, long-run endurance, independent replication) are
+**operator-validated by design**: they depend on live networks and hardware this repository cannot
+exercise on its own.

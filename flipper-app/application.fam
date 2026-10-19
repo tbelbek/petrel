@@ -9,12 +9,13 @@ App(
                            # corrupted the heap, surfacing as loader 'Out of Memory'
                            # (note: an unrelated 'BusFault' on Exit is still open)
     fap_category="GPIO",
-    # Optional values
-    # fap_version="0.1",
+    # fap_version is paired with the firmware's PETREL_FW_VERSION (see RELEASING.md): the FAP major.minor
+    # must match the companion firmware it talks to. 1.0 <-> firmware 1.0.0.
+    fap_version="1.0",
     fap_icon="petrel_rtl.png",  # 10x10 1-bit PNG
-    # fap_description="A simple app",
-    # fap_author="J. Doe",
-    # fap_weburl="https://github.com/user/template",
+    fap_description="Dual-band (2.4+5 GHz) Wi-Fi + BLE security-research toolkit for the RTL8720DN/BW16 companion board.",
+    fap_author="Petrel contributors",
+    fap_weburl="https://github.com/tbelbek/petrel",
     fap_icon_assets="images",  # Image assets to compile for this application
     fap_libs=["assets", "hwdrivers"],
 )
