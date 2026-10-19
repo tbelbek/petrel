@@ -124,3 +124,27 @@ row blank until you have actually run it — an empty cell is honest; a guessed 
 Rows that need third-party RF (joinable-AP end-to-end, long-run endurance, independent replication) are
 **operator-validated by design**: they depend on live networks and hardware this repository cannot
 exercise on its own.
+
+### Verification log — v1.0.0 (2026-10-19)
+
+What was actually verified for this release, and — just as importantly — what was **not**. Nothing
+below is inferred: each "verified" line was run; each "not verified" line needs hardware/RF the repo
+cannot exercise itself.
+
+**Verified (host / build, reproducible without a board):**
+- Capture validator unit tests: `common/petrel_capture_quality_test.c` — 18/18 pass under
+  `cc -O2 -Wall -Wextra` (no warnings). Covers valid M1+M2 / M2+M3, replay & STA mismatch, duplicate,
+  explicit off-target rejection, truncation, degenerate nonce/MIC, QoS-header offset, direction/`kdl`
+  consistency, key-version pair mismatch, M2+M3 BSSID binding, histogram, capacity.
+- Flipper app: `ufbt` build clean (Target 7, API 88.2); `.fap` produced and APPCHK-passed.
+- Companion firmware: `firmware-build/build_petrel.sh` linux/amd64 Docker build clean;
+  `km0_km4_image2.bin` produced (958 KB, 46% of program storage). BSSID-filter + QoS/HT offset compile.
+
+**NOT verified (requires operator hardware / live RF — fill the matrix above):**
+- On-device flash + boot of the v1.0.0 image on a physical BW16.
+- Every RF row in the coverage matrix: 2.4/5 GHz capture against real APs/clients, PMKID clientless,
+  eviltwin/SoftAP joinability (DHCP+DNS+HTTP), off-target rejection on a shared channel.
+- Long-run endurance, repeated mode-change/cancellation reliability, and independent replication.
+
+So "v1.0.0" means the code is build-clean and its host-testable logic is proven — not that its radio
+behaviour has been independently RF-verified. Treat RF claims as expectations until the matrix is filled.
