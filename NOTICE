@@ -1,0 +1,25 @@
+Petrel — NOTICE
+
+Petrel is a security-research and educational project. It is INTENDED FOR AUTHORIZED
+SECURITY RESEARCH, EDUCATION, AND TESTING ONLY.
+
+- Use it only on networks and devices you own, or for which you hold explicit written
+  authorization to test. Operating it against systems you do not own or are not
+  authorized to test may be unlawful in your jurisdiction, and is not a use the authors
+  endorse, encourage, or support.
+
+- Features that transmit radio frames (deauthentication, rogue/evil-twin access points,
+  management-frame floods, channel-switch and BSS-transition frames, probe/beacon
+  tooling) can disrupt third-party networks and devices. They are provided for authorized
+  testing, defensive research, and education only.
+
+- No real-brand or credential-capturing captive-portal pages are distributed with this
+  repository; the public tree ships only a neutral placeholder page.
+
+- The software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND. The authors and
+  contributors accept NO LIABILITY for any damage, data loss, or legal consequence
+  arising from its use or misuse. See the DISCLAIMER in README.md and the MIT LICENSE.
+
+By downloading, building, or using Petrel you confirm that you will operate within a
+lawful, authorized scope, and that you are solely responsible for compliance with all
+applicable local, national, and international laws.
