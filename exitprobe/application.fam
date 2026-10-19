@@ -1,0 +1,8 @@
+App(
+    appid="exitprobe",
+    name="ExitProbe",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="exitprobe_app",
+    stack_size=8 * 1024,
+    fap_category="GPIO",
+)

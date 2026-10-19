@@ -1,0 +1,24 @@
+flipper-app/dist/
+flipper-app/.vscode/
+firmware-build/out/
+tools/artifacts/fapcrash-*/
+tools/artifacts/*.png
+__pycache__/
+*.pyc
+
+# LOCAL-ONLY offensive host tooling — never publish
+tools/attack_lab.py
+tools/attack_lab_web.py
+
+# Real-brand captive portals — PRIVATE overlay repo only (GitHub ToS / trademark
+# + phishing liability). The neutral portals/default.h stays public; these must not.
+RTL8720dn-firmware/portals/amazon.h
+RTL8720dn-firmware/portals/apple.h
+RTL8720dn-firmware/portals/facebook.h
+RTL8720dn-firmware/portals/compressed/*.h
+RTL8720dn-firmware/portals/compressed/amazon.html
+RTL8720dn-firmware/portals/compressed/apple.html
+RTL8720dn-firmware/portals/compressed/facebook.html
+RTL8720dn-firmware/portals/compressed/google.html
+RTL8720dn-firmware/portals/compressed/microsoft.html
+portals/google-signin.html
