@@ -6,6 +6,7 @@
 #include <furi_hal_rtc.h>
 #include "uart_helper.h"
 #include "petrel_capture_quality.h"
+#include "petrel_audit_method.h"
 #include <gui/view_dispatcher.h>
 #include <gui/scene_manager.h>
 #include <gui/modules/menu.h>
@@ -270,6 +271,19 @@ static uint8_t audit_bssid_bytes[6];     // target BSSID as bytes, for pcq/PMKID
 static bool audit_bssid_valid = false;   // true only when a specific (non-wildcard) target is set
 static int audit_ch = 0;
 static int audit_sec = 0;
+static char audit_hex[13];                // target BSSID, 12 hex no colons (for STASCAN/grab)
+// Guided audit runs an async scan chain before it commits to a method: PMFSCAN -> (maybe) STASCAN
+// -> grab. audit_phase tracks which reply we are waiting for; all reads/writes are on the GUI
+// (dispatcher) thread (uart_process_line + scene handlers), so no volatile is needed.
+typedef enum {
+    AUDIT_PHASE_NONE = 0, // no scan in flight (either idle, or the grab was already sent)
+    AUDIT_PHASE_PMF,      // PMFSCAN sent, waiting PMFDONE
+    AUDIT_PHASE_STA,      // STASCAN sent, waiting STADONE
+} AuditScanPhase;
+static AuditScanPhase audit_phase = AUDIT_PHASE_NONE;
+static bool audit_pmf_seen = false;       // the PMFSCAN produced a PMF: line for the target
+static bool audit_pmf_req = false;        // ...and it said mfp=req (PMF mandatory)
+static int audit_stas = 0;                // stations seen for the target in the STASCAN
 //Objeto del APP
 
 typedef struct Petrel {
@@ -1863,6 +1877,8 @@ static void petrel_start_audit(Petrel* app) {
             audit_bssid_valid = true;
         }
     }
+    strncpy(audit_hex, hex, sizeof(audit_hex) - 1);   // kept for the STASCAN/grab the chain sends
+    audit_hex[sizeof(audit_hex) - 1] = '\0';
     // Unsupported target: an open / WEP AP has no WPA 4-way handshake or RSN PMKID to capture, so
     // there is nothing to audit. WPA1/WPA2/WPA3 all have a 4-way handshake (or PMKID), so they are
     // auditable. Record a structured unsupported result (not just a popup) so a refused audit still
@@ -1878,18 +1894,34 @@ static void petrel_start_audit(Petrel* app) {
     recon_text[0] = '\0';
     snprintf(recon_title, sizeof(recon_title), "Audit");
     wpa_lines[0] = '\0';
-    // Guided method selection: a PMF / WPA3 AP (802.11w) signs its management frames, so a deauth
-    // can't kick a client to force a 4-way handshake -> go clientless and pull the PMKID from the
-    // AP's own M1. Otherwise capture the handshake (deauth-assisted). The completion path quality-
-    // gates the result either way.
+    // Guided method selection is PMF- and station-aware (vs. the old coarse security-bit guess). We
+    // first learn the AP's PMF posture with a PMFSCAN; if it is deauthable we then check whether it
+    // has associated clients with a BSSID-filtered STASCAN. PMFDONE/STADONE run audit_pick_method()
+    // and launch the grab (see audit_send_grab). That attribution needs a concrete BSSID, so the
+    // scan chain only runs for a specific target; a wildcard keeps the old bit heuristic.
+    audit_phase = AUDIT_PHASE_NONE;
+    audit_pmf_seen = false;
+    audit_pmf_req = false;
+    audit_stas = 0;
+    if(audit_bssid_valid) {
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "PMFSCAN %d 5\n", ch);
+        uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+        audit_phase = AUDIT_PHASE_PMF;
+        { char b[48]; snprintf(b, sizeof(b), "PMF scan ch %d...", ch);
+          petrel_busy_ex(app, "Audit: PMF", b, 5); }
+        return;
+    }
+    // Wildcard target (no specific AP): scans can't be attributed to one BSSID, so fall back to the
+    // coarse heuristic - PMF/WPA3 bits -> clientless PMKID, else handshake (unchanged behavior).
     bool pmf = (audit_sec & WPA3_SECURITY) || (audit_sec & AES_CMAC_ENABLED);
     char cmd[72];
     const char* label;
     if(pmf) {
-        snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", ch, hex[0] ? hex : "FFFFFFFFFFFF", audit_ssid);
+        snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", ch, "FFFFFFFFFFFF", audit_ssid);
         label = "Audit (PMKID, PMF)";
     } else {
-        snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, hex[0] ? hex : "FFFFFFFFFFFF");
+        snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, "FFFFFFFFFFFF");
         label = "Audit (handshake)";
     }
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
@@ -4392,6 +4424,15 @@ void busy_scene_on_exit(void* context) {
     Petrel* app = context;
     furi_timer_stop(app->busyTimer);
     busy_active = false;
+    // A guided audit (scan chain PMFSCAN -> STASCAN -> grab) spans the busy screen. If we leave it
+    // with the audit still pending - user backed out, watchdog fired, or the board sent ERROR - drop
+    // the audit so a late reply can't resume an abandoned grab and a later unrelated HSDONE/PMKIDDONE
+    // can't be mistaken for this audit's completion. Normal completion clears audit_mode (in
+    // audit_write_json) before popping the busy screen, so this is a no-op there.
+    if(audit_mode) {
+        audit_mode = false;
+        audit_phase = AUDIT_PHASE_NONE;
+    }
 }
 
 // Set the operation name + detail and switch to the animated busy screen.
@@ -4404,6 +4445,43 @@ static void petrel_busy_ex(Petrel* app, const char* header, const char* text, in
 }
 static void petrel_busy(Petrel* app, const char* header, const char* text) {
     petrel_busy_ex(app, header, text, 0);
+}
+
+// Does a "PMF:" payload (the line after the "PMF:" tag) belong to the AP being audited? The payload
+// opens with the BSSID as "AA:BB:CC:DD:EE:FF" (firmware %02X, uppercase, colon-separated).
+static bool pmf_line_is_target(const char* s) {
+    for(int i = 0; i < 6; i++) {
+        char hi = s[i * 3];                                  // test hi before reading lo so a
+        if(!is_hex(hi)) return false;                        // truncated line (hi == '\0') never
+        char lo = s[i * 3 + 1];                              // reads past the string terminator
+        if(!is_hex(lo)) return false;
+        if(i < 5 && s[i * 3 + 2] != ':') return false;
+        uint8_t b = (uint8_t)((hexnib(hi) << 4) | hexnib(lo));
+        if(b != audit_bssid_bytes[i]) return false;
+    }
+    return true;
+}
+
+// Launch the grab the audit scan chain settled on. Called from PMFDONE/STADONE with the busy screen
+// already up, so it relabels in place and re-arms the watchdog (busy_ticks, like batch_step) instead
+// of pushing a second busy scene. audit_mode stays true; the existing HSDONE/PMKIDDONE completion
+// path quality-gates the result and writes audit.json whichever method ran.
+static void audit_send_grab(Petrel* app, AuditMethod method) {
+    char cmd[72];
+    const char* tgt = audit_hex[0] ? audit_hex : "FFFFFFFFFFFF";
+    if(method == AUDIT_METHOD_PMKID) {
+        snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", audit_ch, tgt, audit_ssid);
+        snprintf(popupHeader, sizeof(popupHeader), "Audit: PMKID");
+        snprintf(message, sizeof(message), "Clientless PMKID ch %d...", audit_ch);
+    } else {
+        snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", audit_ch, tgt);
+        snprintf(popupHeader, sizeof(popupHeader), "Audit: handshake");
+        snprintf(message, sizeof(message), "Deauth + HS ch %d...", audit_ch);
+    }
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    audit_phase = AUDIT_PHASE_NONE;
+    busy_total_s = 20;
+    busy_ticks = 0;   // re-arm the per-phase watchdog for the grab
 }
 
 void popup_scene_on_enter(void* context) {
@@ -5485,6 +5563,30 @@ void uart_process_line(FuriString* line, void* context) {
             post_event(app, PETREL_EVT_POPUP);
         }
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
+        if(audit_mode && audit_phase == AUDIT_PHASE_PMF) {
+            // Guided audit, PMF scan done. Decide whether the AP is PMF-required (from its PMF: line,
+            // else the coarse security bits). Required -> deauth is useless -> PMKID now, no need to
+            // enumerate stations. Deauthable -> run STASCAN and decide handshake-vs-PMKID on STADONE.
+            audit_phase = AUDIT_PHASE_NONE;
+            if(!busy_active) { audit_mode = false; return; }   // user left during the scan
+            bool pmf_required = audit_pmf_seen ?
+                                    audit_pmf_req :
+                                    ((audit_sec & WPA3_SECURITY) || (audit_sec & AES_CMAC_ENABLED));
+            if(pmf_required) {
+                audit_send_grab(app, AUDIT_METHOD_PMKID);
+            } else {
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "STASCAN %d %s 8\n", audit_ch, audit_hex);
+                uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+                audit_phase = AUDIT_PHASE_STA;
+                busy_total_s = 8;
+                busy_ticks = 0;   // re-arm the per-phase watchdog for the STA scan
+                snprintf(popupHeader, sizeof(popupHeader), "Audit: stations");
+                snprintf(message, sizeof(message), "STA scan ch %d...", audit_ch);
+            }
+            return;
+        }
+        if(!busy_active) return;   // stale/cancelled scan reply: don't yank the UI to recon
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
         const char* s = strstr(furi_string_get_cstr(line), "aps=");
         sess_pmf = s ? atoi(s + 4) : 0;
@@ -5494,6 +5596,16 @@ void uart_process_line(FuriString* line, void* context) {
         // A6: classify "<mac>|<ssid>|akm=N|sae=N|mfp=cap|req" into a WPA3/WPA2 verdict so the
         // recon view reads like an inventory (and transition-mode downgrades stand out).
         const char* s = furi_string_get_cstr(line) + 4;
+        if(audit_mode && audit_phase == AUDIT_PHASE_PMF) {
+            // Audit PMF scan: capture only the target AP's PMF posture; skip recon_append so the
+            // other on-channel APs don't pollute recon_text (a cancelled fall-through shows it).
+            if(audit_bssid_valid && pmf_line_is_target(s)) {
+                audit_pmf_seen = true;
+                const char* m = strstr(s, "mfp=");
+                audit_pmf_req = m && !strncmp(m + 4, "req", 3);
+            }
+            return;
+        }
         const char* sae = strstr(s, "sae=");
         const char* mfp = strstr(s, "mfp=");
         int sae_v = sae ? atoi(sae + 4) : 0;
@@ -5511,6 +5623,23 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(out, sizeof(out), "%.60s %s", s, cls);
         recon_append(out);
     } else if(strncmp(furi_string_get_cstr(line), "STADONE:", 8) == 0) {
+        if(audit_mode && audit_phase == AUDIT_PHASE_STA) {
+            // Guided audit, station scan done (only reached for a deauthable AP). Stations present ->
+            // deauth-assisted handshake; none -> clientless PMKID. audit_pick_method is the single
+            // source of truth (here pmf_required is false, so it reduces to the station test).
+            audit_phase = AUDIT_PHASE_NONE;
+            if(!busy_active) { audit_mode = false; return; }   // user left during the scan
+            const char* s = strstr(furi_string_get_cstr(line), "n=");
+            audit_stas = s ? atoi(s + 2) : 0;
+            AuditMethod m = audit_pick_method(
+                audit_pmf_seen,
+                audit_pmf_req,
+                (audit_sec & WPA3_SECURITY) || (audit_sec & AES_CMAC_ENABLED),
+                audit_stas);
+            audit_send_grab(app, m);
+            return;
+        }
+        if(!busy_active) return;   // stale/cancelled scan reply: don't yank the UI to recon
         snprintf(recon_title, sizeof(recon_title), "Stations");
         const char* s = strstr(furi_string_get_cstr(line), "n=");
         sess_stas = s ? atoi(s + 2) : 0;
