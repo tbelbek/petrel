@@ -108,8 +108,9 @@ row blank until you have actually run it — an empty cell is honest; a guessed 
 | Eviltwin / SoftAP joinable (DHCP+DNS+HTTP) | 2.4 GHz | client gets IP, portal loads | |
 | Eviltwin / SoftAP joinable | 5 GHz 36 / 149 | client gets IP, portal loads | |
 | Off-target handshake rejected | shared channel | other AP's pair NOT counted | |
-| Mode-change / cancel (scan→audit→stop ×N) | n/a | no wedge, FAP stays responsive | |
-| Long run / SD-full behaviour | n/a | failed save surfaced, no false COMPLETE | |
+| Mode-change / cancel (AP start→stop ×N + cancel) | n/a | no wedge, board stays responsive | **PASS 2026-10-19** — 10/10 AP cycles + cancellation clean (no stray READY, returns to idle), 0 faults/resets, max PING RTT 9 ms |
+| Long run / SD-full behaviour | n/a | failed save surfaced, no false COMPLETE | **Endurance PASS 2026-10-19** — 60-lap FAP self-test soak: no crash/fault/OOM, no heap leak (boot_min flat 4624, largest-block stable); SD-full not yet tested |
+| FAP scene traversal (nav crash/OOM) | n/a | clean 3-lap self-exit, no faults | **PASS 2026-10-19** — self-test 3-lap: kind7/8/9/10 complete, fault=0, clean exit to desktop |
 
 ### Reproducing results
 
@@ -140,11 +141,20 @@ cannot exercise itself.
 - Companion firmware: `firmware-build/build_petrel.sh` linux/amd64 Docker build clean;
   `km0_km4_image2.bin` produced (958 KB, 46% of program storage). BSSID-filter + QoS/HT offset compile.
 
-**NOT verified (requires operator hardware / live RF — fill the matrix above):**
-- On-device flash + boot of the v1.0.0 image on a physical BW16.
-- Every RF row in the coverage matrix: 2.4/5 GHz capture against real APs/clients, PMKID clientless,
-  eviltwin/SoftAP joinability (DHCP+DNS+HTTP), off-target rejection on a shared channel.
-- Long-run endurance, repeated mode-change/cancellation reliability, and independent replication.
+**Verified on-device (BW16 + Flipper, 2026-10-19):**
+- Firmware flashed to a physical BW16 (image2 verified ok) and the FAP launched on the Flipper.
+- FAP scene-traversal self-test (3-lap): complete diagnostics, 0 faults, clean self-exit to desktop.
+- Endurance soak (60-lap self-test, ~28 min / 600 scene transitions): no crash/fault/OOM and no heap
+  leak (boot_min flat at 4624, largest free block stable at 12312; ~30 diag breadcrumbs dropped by the
+  known recorder concurrency limitation — app behaviour was complete).
+- AP mode-change / cancellation reliability: 10/10 AP start→ready→stop cycles plus a cancellation all
+  clean (no stray READY, returns to idle), 0 faults/resets, board responsive throughout (max RTT 9 ms).
+
+**NOT verified (requires real APs/clients or third parties — fill the matrix above):**
+- Live capture outcomes against real APs/clients: 2.4/5 GHz handshake/PMKID, PMKID clientless,
+  off-target rejection on a shared channel.
+- Eviltwin/SoftAP joinability end-to-end (a real client joining + DHCP/DNS/HTTP), SD-full behaviour,
+  and independent replication by a third party.
 
 So "v1.0.0" means the code is build-clean and its host-testable logic is proven — not that its radio
 behaviour has been independently RF-verified. Treat RF claims as expectations until the matrix is filled.
