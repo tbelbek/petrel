@@ -1678,12 +1678,18 @@ bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
         return true;
     case PETREL_EVT_INFO_EVIL:
-        // CONTAINMENT (architect directive): do not send EVIL or open the credentials scene. The
-        // board-side path can stall loop() (synchronous createAP, then an unbounded HTTP client
-        // loop), which leaves the board unresponsive. Local result only.
-        snprintf(message, sizeof(message), "%s", "Evil disabled");
-        snprintf(popupHeader, sizeof(popupHeader), "%s", "Unavailable");
-        post_event(app, PETREL_EVT_POPUP);
+        // Clone the selected AP (SSID + channel) as an open AP with the selected portal and deauth
+        // the real one, then show the credential screen. The board brings the AP up through its
+        // cooperative lifecycle, so loop() stays responsive.
+        FURI_LOG_D(TAG, "%s evil", __func__);
+        if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
+        {
+            int id = app->wifiList[app->selectedWifi].idAP;
+            app->wifiList[app->selectedWifi].deauth = true;
+            snprintf(cadena, sizeof(cadena), "EVIL %d\n", id);
+            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+            scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        }
         return true;
     case PETREL_EVT_INFO_EDIT:
         FURI_LOG_D(TAG, "%s edit", __func__);
@@ -2226,7 +2232,7 @@ static void petrel_load_portal_file(Petrel* app, const char* name) {
     // this buffer lived for the whole session while only being used here (portal load never overlaps
     // a recon scan) - moving it off BSS gives recon result scenes the headroom they were OOM-crashing
     // the whole Flipper for (B2). Fragmentation-safe: at idle largest free block ~= free heap.
-    uint8_t* buf = malloc(8192);
+    uint8_t* buf = malloc(6144);   // board-side customPortal cap
     if(!buf) {
         snprintf(message, sizeof(message), "Low memory");
         snprintf(popupHeader, sizeof(popupHeader), "Portal");
@@ -2237,7 +2243,7 @@ static void petrel_load_portal_file(Petrel* app, const char* name) {
     File* f = storage_file_alloc(st);
     size_t n = 0;
     if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        n = storage_file_read(f, buf, 8192);
+        n = storage_file_read(f, buf, 6144);
         storage_file_close(f);
     }
     storage_file_free(f);

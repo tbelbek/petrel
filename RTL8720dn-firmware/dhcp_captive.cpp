@@ -1,5 +1,6 @@
 #include "dhcp_captive.h"
 #include "dhcp_build.h"
+#include "lwip_log.h"
 #include <lwip/udp.h>
 #include <lwip/pbuf.h>
 #include <lwip/ip_addr.h>
@@ -66,7 +67,12 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     ip_addr_t bcast;
     IP_ADDR4(&bcast, 255, 255, 255, 255);
     err_t e = udp_sendto_if(pcb, op, &bcast, DHCP_CLI_PORT, ap_netif ? ap_netif : find_ap_netif());
-    printf("DHCP: reply type=%d len=%d send=%d\n", repbuf[DHCP_FIXED_LEN + 6], (int)n, (int)e);
+    {   // tcpip thread: defer the UART write to loop() (a blocking write here stalls the stack)
+        char lb[80];
+        snprintf(lb, sizeof(lb), "DHCP: reply type=%d len=%d send=%d",
+                 repbuf[DHCP_FIXED_LEN + 6], (int)n, (int)e);
+        lwip_log(lb);
+    }
     pbuf_free(op);
 }
 

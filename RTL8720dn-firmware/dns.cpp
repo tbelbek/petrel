@@ -1,4 +1,5 @@
 #include "dns.h"
+#include "lwip_log.h"
 #define DNS_QR_RESPONSE        1
 
 uint8_t dhcpServer[4]={192,168,4,1};
@@ -25,6 +26,10 @@ static void dnss_receive_udp_packet_handler(
         DNSQuestion dnsQuestion;
         int sizeUrl;
 
+        if (udp_packet_buffer->len < DNS_HEADER_SIZE) {   // truncated header: memcpy below would over-read
+          pbuf_free(udp_packet_buffer);
+          return;
+        }
         memcpy(&dnsHeader, udp_packet_buffer->payload, DNS_HEADER_SIZE);
         if (dnsHeader.QR != DNS_QR_QUERY) {
           pbuf_free(udp_packet_buffer);
@@ -38,10 +43,18 @@ static void dnss_receive_udp_packet_handler(
               // Each label contains a byte to describe its length and the label itself. The list of
               // labels terminates with a zero-valued byte. In "github.com", we have two labels "github" & "com"
         */
-            const char *enoflbls = strchr(reinterpret_cast<const char *>(udp_packet_buffer->payload) + DNS_HEADER_SIZE, 0);  // find end_of_label marker
+            const char *qstart = reinterpret_cast<const char *>(udp_packet_buffer->payload) + DNS_HEADER_SIZE;
+            // memchr, not strchr: the pbuf payload is not NUL-terminated, so strchr could walk past
+            // the packet. No terminator -> malformed, and the old code then did pointer math on NULL.
+            const char *enoflbls = reinterpret_cast<const char *>(
+                memchr(qstart, 0, udp_packet_buffer->len - DNS_HEADER_SIZE));
+            if (!enoflbls) {
+              pbuf_free(udp_packet_buffer);
+              return;  // no end_of_label marker
+            }
             ++enoflbls;                                                                                      // advance after null terminator
             dnsQuestion.QName = (uint8_t *)udp_packet_buffer->payload + DNS_HEADER_SIZE;                                                // we can reference labels from the request
-            dnsQuestion.QNameLength = enoflbls - (char *)udp_packet_buffer->payload - DNS_HEADER_SIZE;
+            dnsQuestion.QNameLength = enoflbls - qstart;
             sizeUrl = static_cast<int>(dnsQuestion.QNameLength);
             
             /*
@@ -70,14 +83,25 @@ static void dnss_receive_udp_packet_handler(
                 nm[qo++] = '.';
               }
               nm[qo] = 0;
-              printf("DNS: \"%s\" qtype=%u -> 192.168.4.1\n", nm, dnsQuestion.QType);
+              {   // tcpip thread: defer the UART write to loop()
+                char lb[96];
+                snprintf(lb, sizeof(lb), "DNS: \"%s\" qtype=%u -> 192.168.4.1", nm, dnsQuestion.QType);
+                lwip_log(lb);
+              }
             }
                 
 
             int questionSectionSize = dnsQuestion.QNameLength + sizeof(uint16_t) + sizeof(uint16_t);  // QName + QType + QClass
+            const uint16_t qtype = dnsQuestion.QType;
+            // A (1) -> 4-byte IPv4. AAAA (28) -> IPv4-mapped IPv6 (::ffff:a.b.c.d, 16 bytes) so
+            // v6-preferring clients still resolve. Anything else -> no answer, question echoed.
+            const bool ans_a    = (qtype == 1);
+            const bool ans_aaaa = (qtype == 28);
+            const uint16_t rdlen = ans_a ? 4 : (ans_aaaa ? 16 : 0);
+            const uint16_t ancount = (ans_a || ans_aaaa) ? 1 : 0;
 
             // Reservamos espacio para el DNS response (Header + Question + Answer)
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct dns_hdr) + questionSectionSize + 16, PBUF_RAM);
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct dns_hdr) + questionSectionSize + 32, PBUF_RAM);
 
             if (p) {
                 struct dns_hdr *rsp_hdr = (struct dns_hdr *)p->payload;
@@ -88,7 +112,7 @@ static void dnss_receive_udp_packet_handler(
                 rsp_hdr->flags1 = 0x85; // QR=1, AA=1, RD=1
                 rsp_hdr->flags2 = 0x80; // RA=1
                 rsp_hdr->numquestions = PP_HTONS(1);
-                rsp_hdr->numanswers = PP_HTONS(1);
+                rsp_hdr->numanswers = PP_HTONS(ancount);
                 rsp_hdr->numauthrr = PP_HTONS(0);
                 rsp_hdr->numextrarr = PP_HTONS(0);
 
@@ -97,27 +121,36 @@ static void dnss_receive_udp_packet_handler(
                       (uint8_t *)udp_packet_buffer->payload + sizeof(struct dns_hdr),
                       questionSectionSize);
 
-                // Construcción de la sección de respuesta
-                uint8_t *answer_ptr = (uint8_t *)rsp_hdr + sizeof(struct dns_hdr) + questionSectionSize;
+                if (ancount) {
+                  // Construcción de la sección de respuesta
+                  uint8_t *answer_ptr = (uint8_t *)rsp_hdr + sizeof(struct dns_hdr) + questionSectionSize;
 
-                // Nombre del dominio (compresión, apuntando a QName en offset 12)
-                answer_ptr[0] = 0xC0;
-                answer_ptr[1] = 0x0C;
+                  // Nombre del dominio (compresión, apuntando a QName en offset 12)
+                  answer_ptr[0] = 0xC0;
+                  answer_ptr[1] = 0x0C;
 
-                // Tipo A
-                *(uint16_t *)(answer_ptr + 2) = PP_HTONS(1);
+                  // Tipo: echo the question's own type (A or AAAA)
+                  *(uint16_t *)(answer_ptr + 2) = PP_HTONS(qtype);
 
-                // Clase IN
-                *(uint16_t *)(answer_ptr + 4) = PP_HTONS(1);
+                  // Clase IN
+                  *(uint16_t *)(answer_ptr + 4) = PP_HTONS(1);
 
-                // TTL (0 segundos)
-                *(uint32_t *)(answer_ptr + 6) = PP_HTONL(0);
+                  // TTL (0 segundos)
+                  *(uint32_t *)(answer_ptr + 6) = PP_HTONL(0);
 
-                // Longitud de datos: 4 bytes (IPv4)
-                *(uint16_t *)(answer_ptr + 10) = PP_HTONS(4);
+                  // Longitud de datos
+                  *(uint16_t *)(answer_ptr + 10) = PP_HTONS(rdlen);
 
-                // Dirección IP a retornar (ej. dhcpServer contiene el puntero al uint8_t[4])
-                memcpy(answer_ptr + 12, (void *)dhcpServer, 4);
+                  if (ans_a) {
+                    // Dirección IP a retornar (ej. dhcpServer contiene el puntero al uint8_t[4])
+                    memcpy(answer_ptr + 12, (void *)dhcpServer, 4);
+                  } else {
+                    // ::ffff:a.b.c.d
+                    memset(answer_ptr + 12, 0, 10);
+                    answer_ptr[22] = 0xFF; answer_ptr[23] = 0xFF;
+                    memcpy(answer_ptr + 24, (void *)dhcpServer, 4);
+                  }
+                }
 
                 // Enviar respuesta
                 udp_sendto(udp_pcb, p, sender_addr, sender_port);
@@ -145,9 +178,13 @@ static void dnss_receive_udp_packet_handler(
 static struct udp_pcb *dns_server_pcb;
 
 void unbind_all_udp(){
-  struct udp_pcb *pcb;
-  for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+  // Grab ->next BEFORE udp_remove(): the removed pcb is freed, so "pcb = pcb->next" walked freed
+  // memory (use-after-free). Same fix as unbind_dns() below.
+  struct udp_pcb *pcb = udp_pcbs;
+  while (pcb != NULL) {
+      struct udp_pcb *next = pcb->next;
       udp_remove(pcb);
+      pcb = next;
   }
 }
 

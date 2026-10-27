@@ -74,6 +74,29 @@ test — this project does not ship demonstrated‑impact claims for them.
 Real‑brand credential‑capture portals are **not** in this repository (neutral Default page only);
 they live in a separate private overlay for GitHub‑ToS / trademark / phishing‑liability reasons.
 
+### Captive‑portal behaviour
+
+The portal is served by a raw‑lwIP listener on the SoftAP, not by the Arduino `WiFiServer`
+(whose accept never fires on the AP). What the listener does, per request:
+
+| Request | Un‑authorized client | Client that already submitted the form |
+|---------|----------------------|----------------------------------------|
+| OS probe (`generate_204`, `ncsi`, `hotspot`, …) | 302 to the portal root | **204 No Content** (clears "connected, no internet") |
+| `/cp.json` (RFC 8908) | `captive:true` | `captive:false` |
+| anything else | the selected portal page | the selected portal page |
+
+- **Authorization** is keyed on the client's IPv4 and lasts until the AP is torn down.
+- **Rotation** (`PORTALROT 1`) advances to the next page on every credential submit; `Custom`
+  (the page loaded from SD) is never rotated away from.
+- **URLs** (DHCP option 114, the 302 `Location`, the `cp.json` body) are all derived from the AP
+  SSID by `build_portal_urls()`, so they always agree with each other and with the DNS hijack.
+- The page is streamed with `TCP_WRITE_FLAG_COPY` for the mutable buffers (Default, Custom) and
+  zero‑copy only for immutable flash gzip blobs.
+
+Both entry points are live: **Create AP** (`APSTART`) and **Evil** (`EVIL <n>`, which also deauths
+the real AP). Both run through the cooperative AP lifecycle, so `loop()` stays responsive and a
+bare `STOP` tears the AP down from any state.
+
 ## BLE
 
 | Feature | Status | Notes |
@@ -158,3 +181,40 @@ cannot exercise itself.
 
 So "v1.0.0" means the code is build-clean and its host-testable logic is proven — not that its radio
 behaviour has been independently RF-verified. Treat RF claims as expectations until the matrix is filled.
+
+### Code-review hardening (2026-10-27)
+
+A full review of the Wi-Fi card firmware found 23 defects. All are fixed; the same fixes are applied
+to the sibling `delfyRTL` tree, whose code was byte-identical. Build-verified only — the RF rows
+above are still open.
+
+**Dead code removed.** The legacy Arduino `WiFiServer` path (~120 lines) could never run: `atStart()`
+always sets `webui_mode` or `web_portal_mode`, so its guard was permanently false. `handleRequest`,
+`makeResponse`, `parseRequest`, `handle204/404`, `handleRedirect`, `ip_is_authed` and the per-loop
+`server.available()` accept loop are gone; the raw-lwIP listener is the only HTTP server.
+
+**Dead features made live.** `EVIL` and `createAP()` were stubs that only printed
+`ERROR:Evil disabled`, so the app's main flow (scan → select → Evil) was inert. Both now start the
+clone AP through the cooperative lifecycle and deauth the target. The portal behaviours that lived
+only in the dead block were ported into `web_lwip.cpp`: per-client authorization with a 204 on OS
+probes, `captive:false` on `/cp.json`, portal rotation, and SSID-derived URLs.
+
+**Memory safety.** Out-of-bounds read of `deauth_wifis` after any list shrink (`current_num` was
+reset only after the dereference); `strchr` on a non-NUL-terminated pbuf plus a missing
+`len >= 12` guard in the DNS handler; use-after-free in `unbind_all_udp()`; leaked send cursor on
+peer FIN; `TX_RAW_MAX_PAYLOAD` (64) smaller than its own buffer (128), which silently dropped the
+DS Parameter Set from beacons; `PORTAL <n>` without a range check.
+
+**Logic.** `atFail(1)` retried forever and never reached `FAILED` (now capped at 3); `tx_raw_chan_ok`
+accepted the non-channels 15–35; `EVILTWIN START … LIVE` accepted DFS and failed 4 s later; the
+IBSS BSSID was read from the wrong address; `hsg_target_set` was never cleared, so a stale filter
+leaked into later passive captures; `rec_note` recorded commands the gate had rejected; `STOP <n>`
+was ignored while an AP was up; `DEAUTHCLEAR` did not clear the deauth list.
+
+**Threading / performance.** DHCP and DNS logged with `printf` from the tcpip thread, blocking the
+stack and racing `loop()` on the UART — both now go through a bounded deferred log drained by
+`loop()`. The 800-byte WebUI buffer moved off the `loop()` stack, `scan_results` is capped at 255
+(the `DP_SCAN_AP` index is a `u8`) and reserved, and `|` in an SSID is escaped in the ASCII list.
+
+**Corrected finding.** The reported `tcp_listen()` double free is not real: lwIP 2.0.2 frees the pcb
+only on success, so the `tcp_close()` on the failure path is correct (noted in the source).
