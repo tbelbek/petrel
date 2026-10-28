@@ -38,13 +38,18 @@ static unsigned g_sends = 0;   // responses currently streaming (their body poin
 // closing the listener alone would leave connections running against state the next start resets.
 #define WEB_CONNS 4
 struct web_conn { struct tcp_pcb* pcb; struct web_send* ws; };
+// 2026-10-28: these records used to be mem_malloc'd. Serving a portal page hard-locked the board
+// right after web_finish(), and the fix has to be structural: a second free of the same record
+// corrupts the lwIP heap and takes the whole board down (no UART, AP dead). Records now live in a
+// static pool, so "freeing" one is just unlinking it - a duplicate free is a no-op instead of a
+// use-after-free.
+static struct web_conn g_conn_pool[WEB_CONNS];
 static struct web_conn* g_conns[WEB_CONNS];
 
 static struct web_conn* conn_add(struct tcp_pcb* p) {
     for (unsigned i = 0; i < WEB_CONNS; i++) {
         if (!g_conns[i]) {
-            struct web_conn* c = (struct web_conn*)mem_malloc(sizeof(struct web_conn));
-            if (!c) return NULL;
+            struct web_conn* c = &g_conn_pool[i];
             c->pcb = p; c->ws = NULL;
             g_conns[i] = c;
             return c;
@@ -59,9 +64,11 @@ static void conn_del(struct web_conn* c) {
 
 static void conn_free(struct web_conn* c) {
     if (!c) return;
+    bool live = false;
+    for (unsigned i = 0; i < WEB_CONNS; i++) if (g_conns[i] == c) { live = true; break; }
+    if (!live) return;                       // already released: a second free is a no-op
     conn_del(c);
-    if (c->ws) { mem_free(c->ws); if (g_sends) g_sends--; }
-    mem_free(c);
+    if (c->ws) { mem_free(c->ws); c->ws = NULL; if (g_sends) g_sends--; }
 }
 
 static void web_abort_conns(void) {
@@ -192,7 +199,7 @@ static void web_close(struct tcp_pcb* tpcb) {
 // (manual itoa: this TU's snprintf is the reduced Realtek DiagSnPrintf that mangles %u). The
 // Content-Length is the FULL body length even when the body is streamed across several writes.
 static int http_hdr(char* hdr, size_t bl, bool gzip) {
-    strcpy(hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
+    strcpy(hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n");
     char* h = hdr + strlen(hdr);
     if (gzip) { strcpy(h, "Content-Encoding: gzip\r\n"); h += strlen(h); }
     strcpy(h, "Content-Length: "); h += strlen(h);

