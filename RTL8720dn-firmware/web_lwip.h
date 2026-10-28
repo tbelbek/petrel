@@ -28,7 +28,8 @@ void web_lwip_set_urls(const char* root, const char* cpjson);
 // must not block or allocate - just advance the selection.
 void web_lwip_set_rotate(void (*fn)(void));
 
-bool web_lwip_poll_creds(char* buf, int cap);                // loop() drains captured creds (EV:)
+bool web_lwip_poll_creds(char* buf, int cap);
+void web_lwip_set_probe204(bool on);           // bench: always answer probes with 204                // loop() drains captured creds (EV:)
 unsigned web_lwip_creds_dropped(void);                       // submissions lost to a full queue
 // Queue a customPortal edit; it runs in the tcpip thread and only while no response is streaming,
 // so an in-flight page keeps its bytes. `arg` is passed through (e.g. the hex chunk to append).
@@ -36,4 +37,14 @@ void web_lwip_portal_edit(void (*fn)(const void* arg), const void* arg);
 // Run a read-only function in the tcpip thread (no idle requirement).
 void web_lwip_in_tcpip(void (*fn)(const void* arg), const void* arg);
 void web_lwip_stop();
+
+// Halt breadcrumbs: call web_lwip_diag_tick() 1x/s from loop(); the getters are the last stage the
+// tcpip thread reached (1 accept, 2 recv, 3 request line, 4 creds, 5 cp.json, 6 probe, 7 resolve,
+// 8 serve, 9 send body, 10 finish, 11 close, 12 tcp_sent), the request counter, and a tcpip-thread
+// tick posted by diag_tick (0 = the tcpip thread has not run since start).
+void web_lwip_diag_tick(void);
+unsigned web_lwip_stage(void);
+unsigned web_lwip_reqs(void);
+unsigned web_lwip_ticks(void);
+unsigned web_lwip_pcb_state(void);
 #endif

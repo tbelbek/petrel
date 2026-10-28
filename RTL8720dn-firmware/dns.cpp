@@ -2,6 +2,12 @@
 #include "lwip_log.h"
 #include "lwip_call.h"
 #include "dhcp_captive.h"
+#include "sp_probe.h"
+#include <lwip/netif.h>
+extern "C" struct netif xnetif[];
+extern int dhcp_captive_ap_ifindex(void);
+volatile unsigned g_dns_stage = 0;
+volatile unsigned g_dns_sz = 0;
 #define DNS_QR_RESPONSE        1
 
 uint8_t dhcpServer[4]={192,168,4,1};
@@ -24,6 +30,8 @@ static void dnss_receive_udp_packet_handler(
 {     
         /* To avoid gcc warnings */
         ( void ) arg;
+        sp_note();
+        __atomic_store_n(&g_dns_stage, 20u, __ATOMIC_RELAXED);
         DNSHeader dnsHeader;
         DNSQuestion dnsQuestion;
 
@@ -71,8 +79,9 @@ static void dnss_receive_udp_packet_handler(
             memcpy(&dnsQuestion.QClass, enoflbls + sizeof(dnsQuestion.QType), sizeof(dnsQuestion.QClass));
         }
         if (dnsHeader.OPCode == DNS_OPCODE_QUERY && requestIncludesOnlyOneQuestion(dnsHeader)){
-            // Log the name we're hijacking (labels -> dotted) so the serial log shows
-            // whether the client's lookups actually reach us.
+            // Log the name we're hijacking (labels -> dotted) so the serial log shows whether the
+            // client's lookups actually reach us. SP sampling showed the tcpip stack is not tight
+            // (~400 B deep), so the original 80/96-byte buffers and snprintf are safe here.
             {
               char nm[80]; int qo = 0, k = 0;
               while (k < (int)dnsQuestion.QNameLength && qo < 78) {
@@ -89,7 +98,6 @@ static void dnss_receive_udp_packet_handler(
                 lwip_log(lb);
               }
             }
-                
 
             int questionSectionSize = dnsQuestion.QNameLength + sizeof(uint16_t) + sizeof(uint16_t);  // QName + QType + QClass
             const uint16_t qtype = ntohs(dnsQuestion.QType);   // wire order -> host order
@@ -104,9 +112,17 @@ static void dnss_receive_udp_packet_handler(
             // + rdata). The old "+32" reservation was transmitted in full, leaking heap bytes past
             // the last answer field.
             const size_t answerSize = ancount ? (size_t)(12 + rdlen) : 0;
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT,
-                                        sizeof(struct dns_hdr) + questionSectionSize + answerSize,
-                                        PBUF_RAM);
+            __atomic_store_n(&g_dns_stage, 21u, __ATOMIC_RELAXED);
+            const unsigned alloc_sz = (unsigned)(sizeof(struct dns_hdr) + questionSectionSize + answerSize);
+            {   // record the requested size: a bogus size is the difference between "NULL" and "hang"
+              char sb[16]; int sn = 0; unsigned v = alloc_sz;
+              do { sb[sn++] = (char)('0' + v % 10); v /= 10; } while (v && sn < 12);
+              sb[sn++] = 'S'; char ob[14]; int on = 0;
+              while (sn) ob[on++] = sb[--sn];
+              ob[on] = 0; (void)ob; g_dns_sz = alloc_sz;
+            }
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)alloc_sz, PBUF_RAM);
+            __atomic_store_n(&g_dns_stage, p ? 26u : 29u, __ATOMIC_RELAXED);
 
             if (p) {
                 struct dns_hdr *rsp_hdr = (struct dns_hdr *)p->payload;
@@ -124,7 +140,7 @@ static void dnss_receive_udp_packet_handler(
                 // Copiamos la sección de pregunta desde el paquete original
                 memcpy((uint8_t *)rsp_hdr + sizeof(struct dns_hdr),
                       (uint8_t *)udp_packet_buffer->payload + sizeof(struct dns_hdr),
-                      questionSectionSize);
+                      questionSectionSize);   // question section copied
 
                 if (ancount) {
                   // Construcción de la sección de respuesta
@@ -151,10 +167,15 @@ static void dnss_receive_udp_packet_handler(
                     answer_ptr[22] = 0xFF; answer_ptr[23] = 0xFF;
                     memcpy(answer_ptr + 24, (void *)dhcpServer, 4);
                   }
-                }
-
+                }   // answer built
                 // Enviar respuesta
-                udp_sendto(udp_pcb, p, sender_addr, sender_port);
+                __atomic_store_n(&g_dns_stage, 22u, __ATOMIC_RELAXED);
+                // 2026-10-28: udp_sendto() left the netif choice to the route table. The AP
+                // netif is xnetif[ap_ifindex]; a reply routed to the idle STA netif goes through a
+                // down interface. Send explicitly, exactly like the DHCP server does.
+                __atomic_store_n(&g_dns_stage, 22u, __ATOMIC_RELAXED);
+                udp_sendto_if(udp_pcb, p, sender_addr, sender_port, &xnetif[dhcp_captive_ap_ifindex()]);
+                __atomic_store_n(&g_dns_stage, 23u, __ATOMIC_RELAXED);
                 pbuf_free(p);
             }
         }
@@ -169,11 +190,13 @@ static void dnss_receive_udp_packet_handler(
                 udp_sendto(udp_pcb, udp_packet_buffer, sender_addr, sender_port);
         }
 
-        /* free the UDP connection, so we can accept new clients */
-        udp_disconnect(udp_pcb);
+        /* 2026-10-28: udp_disconnect() on the listening pcb was unnecessary - the pcb is bound,
+           never connected, and keeps accepting either way. Removed to shrink the send path. */
 
+        __atomic_store_n(&g_dns_stage, 24u, __ATOMIC_RELAXED);
         /* Free the packet buffer */
         pbuf_free(udp_packet_buffer);
+        __atomic_store_n(&g_dns_stage, 25u, __ATOMIC_RELAXED);
 }
 static struct udp_pcb *dns_server_pcb;
 

