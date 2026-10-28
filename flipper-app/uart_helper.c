@@ -306,10 +306,7 @@ bool uart_helper_read(UartHelper* helper, FuriString* text) {
     return ring_buffer_read(helper->ring_buffer, text);
 }
 
-void petrel_tx_probe(const char* s, size_t n);
-
 void uart_helper_send(UartHelper* helper, const char* data, size_t length) {
-    petrel_tx_probe(data, length);
     FURI_LOG_D(TAG, __func__);
 
     FURI_LOG_D(TAG, "%s", data);
