@@ -338,6 +338,7 @@ typedef struct Petrel {
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
     uint32_t shot_tick;  // last framebuffer mirror write (throttle)
+    uint32_t shot_last_sum; // FNV of the last captured frame (skip identical frames)
 } Petrel;
 
 // --- Non-blocking custom-event ring (prioritised plan, item #1) ------------------------------
@@ -505,6 +506,9 @@ static char storage_status[64] = "";   // last outcome, for a status screen
 // repeats on every keypress cannot push a scene on every tick - scene_manager_next_scene() grows the
 // navigation history without a fixed depth limit, which is what produced "out of memory".
 static volatile uint32_t storage_fail_seq = 0;
+// Binary scan list: the board sends idx/total in every DP_SCAN_AP frame, so the GUI thread knows
+// when the whole list has been parsed and can persist it without waiting for the user to open List Wifi.
+static volatile uint8_t scan_expect_total = 0;
 
 // storage_status is written by the storage/UART worker and read by the GUI tick; storage_mutex is
 // only ever held for the queue, so it is free to guard this too.
@@ -555,6 +559,12 @@ static void petrel_fb_callback(
     if(!app || size < SHOT_BYTES) return;
     uint32_t now = furi_get_tick();
     if(now - app->shot_tick < furi_ms_to_ticks(400)) return;   // en fazla ~2.5 kare/sn
+    // Ayni kareyi tekrar yazma: SD'ye yalnizca ekran gercekten degistiginde dokunulur. 1 KB'lik
+    // karsilastirma buffer'i yerine 32-bit FNV izi tutulur (bellek maliyeti yok).
+    uint32_t sum = 2166136261u;
+    for(size_t i = 0; i < SHOT_BYTES; i++) sum = (sum ^ data[i]) * 16777619u;
+    if(sum == app->shot_last_sum) return;
+    app->shot_last_sum = sum;
     app->shot_tick = now;
     char* hex = malloc(2048u + 40u);                           // 2048 hex + satir sonlari
     if(!hex) return;                                           // yer yoksa sessizce atla
@@ -5378,6 +5388,7 @@ static void petrel_scan_frame(uint8_t type, const uint8_t* p, uint16_t len, void
     FuriString* fs = furi_string_alloc_set_str(linebuf);
     uart_enqueue_line(fs, app); // copies into the GUI queue; parsed into wifiList there
     furi_string_free(fs);
+    scan_expect_total = total;   // GUI thread persists the list once it has parsed this many APs
 }
 
 // Dispatcher thread: drain what the worker queued, and finish the scan wait. One line per call so
@@ -5472,6 +5483,16 @@ static void uart_gui_tick(void* context) {
         if(furi_message_queue_get(app->uart_lines, &line, 0) != FuriStatusOk) break;
         uart_process_line(line, app);
         furi_string_free(line);
+    }
+    // The whole scanned list has been parsed: persist it now instead of waiting for the user to open
+    // "List Wifi". Runs on the GUI thread, where wifiList is owned, and petrel_save_wifi_list() has
+    // its own low-heap guard.
+    // "Or the list is full": a dense RF environment can exceed WIFI_MAX, and the parser stops at 48
+    // entries, so waiting for wifiCount to reach the board's `total` would never save anything.
+    if(scan_expect_total &&
+       (app->wifiCount >= scan_expect_total || app->wifiCount >= WIFI_MAX)) {
+        scan_expect_total = 0;
+        petrel_save_wifi_list(app);
     }
     if(app->scan_waiting &&
        (scanFinish || scanFailed || (int32_t)(furi_get_tick() - app->scan_deadline) >= 0)) {

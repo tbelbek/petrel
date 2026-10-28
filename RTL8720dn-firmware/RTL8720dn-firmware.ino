@@ -2553,9 +2553,15 @@ void loop() {
       link_last_rx = nowm;
       link_rearmed = false;
     } else if(!link_rearmed && (nowm - link_last_rx) > 10000u) {
+      // Nothing has arrived for 10 s: any bytes still sitting in the buffers are leftovers from
+      // before the glitch (a real host line arrives in one go), and leaving them there poisons the
+      // next command parse — the first newline would hand the chain "garbage+SCAN" and match
+      // nothing. Re-arm the peripheral AND drop the stale bytes.
       link_rearmed = true;
       Serial1.end();
       Serial1.begin(BAUD);
+      cmdFlip = "";
+      cmdUsb = "";
       Serial.println("LINK:Serial1 re-armed after idle");
     }
   }
@@ -2612,6 +2618,7 @@ void loop() {
         // DP_FRAME. Honour just SNIFF STOP / PING; refuse everything else and reply on Serial1
         // (control) so no ASCII ever lands on the stream the host is decoding.
         if (SNIFF_ON() && command != "SNIFF STOP" && command != "PING" && !command.startsWith("STOP")) {
+            // Control channel only: the bulk channel is carrying DP_FRAME binary right now.
             Serial1.println("ERROR:SNIFF owns radio");
             readString = "";
             continue;
@@ -2621,14 +2628,14 @@ void loop() {
         // commands would collide (single radio). Reply on Serial1 (control) only.
         if (hv_phase != HV_IDLE && !command.startsWith("HARVEST") && command != "PING" &&
             !command.startsWith("STOP")) {
-            Serial1.println("ERROR:HARVEST owns radio");
+            atReply("ERROR:HARVEST owns radio");
             readString = "";
             continue;
         }
 
         // M3: while WIDS monitors (listen-only), only WIDS */PING are honoured (single radio).
         if (wids_on && !command.startsWith("WIDS") && command != "PING" && !command.startsWith("STOP")) {
-            Serial1.println("ERROR:WIDS owns radio");
+            atReply("ERROR:WIDS owns radio");
             readString = "";
             continue;
         }
@@ -2636,7 +2643,7 @@ void loop() {
         // M3: while the evil-twin FSM runs, only EVILTWIN */PING are honoured (single radio).
         if (et_phase != ET_IDLE && !command.startsWith("EVILTWIN") && command != "PING" &&
             !command.startsWith("STOP")) {
-            Serial1.println("ERROR:EVILTWIN owns radio");
+            atReply("ERROR:EVILTWIN owns radio");
             readString = "";
             continue;
         }
@@ -2652,7 +2659,7 @@ void loop() {
                                          command.startsWith("PMKID")))
                          || (karmaOwn && (command.startsWith("KARMA") || command.startsWith("TRAP")));
                 if (!mine) {
-                    Serial1.println("ERROR:CAPTURE owns radio");
+                    atReply("ERROR:CAPTURE owns radio");
                     readString = "";
                     continue;
                 }
