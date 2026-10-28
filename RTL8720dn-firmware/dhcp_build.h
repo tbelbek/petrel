@@ -38,10 +38,12 @@ static inline const uint8_t *dhcp_find_opt(const uint8_t *req, size_t len,
 }
 
 /* Build an OFFER (for DISCOVER) or ACK (for REQUEST). Returns reply length, or 0 to ignore.
-   cp_uri = the RFC 8910 option-114 captive-portal URL (advertised to the client). */
+   cp_uri = the RFC 8910 option-114 captive-portal URL (advertised to the client).
+   host = the last octet to hand out (100..200). The caller owns the lease table, so two clients
+   whose MACs share a last byte no longer get the same address. */
 static inline size_t dhcp_build_reply(uint8_t *out, size_t cap,
                                       const uint8_t *req, size_t req_len,
-                                      const char *cp_uri) {
+                                      const char *cp_uri, uint8_t host) {
     if (req_len < DHCP_FIXED_LEN + 4 || cap < DHCP_MIN_REPLY) return 0;
     if (memcmp(req + DHCP_FIXED_LEN, DHCP_MAGIC, 4) != 0) return 0;
 
@@ -63,7 +65,7 @@ static inline size_t dhcp_build_reply(uint8_t *out, size_t cap,
     out[16] = DHCP_AP_IP[0];        /* yiaddr = 192.168.1.(100..200), stateless per-MAC */
     out[17] = DHCP_AP_IP[1];
     out[18] = DHCP_AP_IP[2];
-    out[19] = (uint8_t)(100 + (req[28 + 5] % 101)); /* chaddr[5] */
+    out[19] = host;                 /* yiaddr host part, from the caller's lease table */
     memcpy(out + 20, DHCP_AP_IP, 4);   /* siaddr */
     memcpy(out + 28, req + 28, 16);    /* chaddr (echo) */
     memcpy(out + DHCP_FIXED_LEN, DHCP_MAGIC, 4);

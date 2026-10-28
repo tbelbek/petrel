@@ -16,7 +16,7 @@ static size_t build_req(uint8_t *req, uint8_t msg_type) {
     req[1] = 1;                 // htype = ethernet
     req[2] = 6;                 // hlen
     req[4] = 0xAA; req[5] = 0xBB; req[6] = 0xCC; req[7] = 0xDD;  // xid
-    req[28] = 0xEA; req[33] = 0x11;  // chaddr (chaddr[5]=0x11 -> yiaddr .117 if %101)
+    req[28] = 0xEA; req[33] = 0x11;  // chaddr (the caller passes the host octet)
     memcpy(req + DHCP_FIXED_LEN, DHCP_MAGIC, 4);
     uint8_t *o = req + DHCP_FIXED_LEN + 4;
     *o++ = 53; *o++ = 1; *o++ = msg_type;   // DHCP message type
@@ -29,7 +29,7 @@ static const char *TEST_URI = "http://freewifi.com/cp.json";
 static void expect_reply(uint8_t msg_type, uint8_t want_reply_type, const char *label) {
     uint8_t req[300], out[600];
     size_t rl = build_req(req, msg_type);
-    size_t n = dhcp_build_reply(out, sizeof(out), req, rl, TEST_URI);
+    size_t n = dhcp_build_reply(out, sizeof(out), req, rl, TEST_URI, 117);
     printf("\n-- %s --\n", label);
     CHECK(n >= DHCP_MIN_REPLY, "reply produced and >= DHCP_MIN_REPLY");
     CHECK(out[0] == 2, "op == BOOTREPLY");
@@ -62,7 +62,7 @@ int main(void) {
     // A bare packet (no magic) must be ignored, not answered.
     uint8_t junk[300] = {0};
     junk[0] = 1;
-    CHECK(dhcp_build_reply(junk, sizeof(junk), junk, sizeof(junk), TEST_URI) == 0, "no magic cookie -> ignored");
+    CHECK(dhcp_build_reply(junk, sizeof(junk), junk, sizeof(junk), TEST_URI, 117) == 0, "no magic cookie -> ignored");
 
     printf("\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
            failures, failures == 1 ? "" : "s");

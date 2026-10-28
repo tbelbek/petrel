@@ -81,11 +81,13 @@ The portal is served by a raw‑lwIP listener on the SoftAP, not by the Arduino 
 
 | Request | Un‑authorized client | Client that already submitted the form |
 |---------|----------------------|----------------------------------------|
-| OS probe (`generate_204`, `ncsi`, `hotspot`, …) | 302 to the portal root | **204 No Content** (clears "connected, no internet") |
+| OS probe (`generate_204`, `ncsi`, `hotspot`, …) | 302 to the portal root | **204 No Content**; Windows `ncsi`/`connecttest` get a 200 with the body they validate |
 | `/cp.json` (RFC 8908) | `captive:true` | `captive:false` |
 | anything else | the selected portal page | the selected portal page |
 
-- **Authorization** is keyed on the client's IPv4 and lasts until the AP is torn down.
+- **Authorization** is keyed on the client's IPv4 and lasts until the AP is torn down or the entry is
+  evicted. The lease/authorization tables hold 8 clients: a ninth distinct client takes the oldest
+  slot, so its address (and authorization) can be reused before the old lease expires.
 - **Rotation** (`PORTALROT 1`) advances to the next page on every credential submit; `Custom`
   (the page loaded from SD) is never rotated away from.
 - **URLs** (DHCP option 114, the 302 `Location`, the `cp.json` body) are all derived from the AP
@@ -110,9 +112,23 @@ bare `STOP` tears the AP down from any state.
 - **DFS (52–144) is RX‑only** by design (radar bands).
 - **Capture buffers are bounded** (firmware 8 frames × 256 B; FAP 16 records) — heavy channel load can drop frames; the validator's reject histogram surfaces why a capture is unusable.
 - **Validation is structural**, not cryptographic: it proves a crackable *exchange shape*, not that the MIC authenticates or that the password will fall.
+- **The FAP's heap budget is tight.** Its image is ~82 KB of the Flipper's 187 KB heap, so free
+  heap is 28–34 KB at idle (23 KB with the CLI attached). Anything that takes a large extra block —
+  most of all an RPC session (`flipctl`, qFlipper), measured at **~20 KB** — pushes it into
+  `out of memory` and reboots the Flipper. Drive keys from the CLI (`input send <key>
+  press|short|release`) and take screenshots with `tools/flip_shot.py` (reads the frame the app
+  mirrors to `/ext/petrel/shot.hex`; no RPC).
+- **Capability-gated menus disappear when IDENT fails.** If the board does not answer `HELLO`,
+  `fw_caps` stays empty and Tools / Load Portal / KARMA rows are hidden. Reset the board **while the
+  Flipper is up** (opening the CH340 does it) and re-enter the Wi-Fi hub to retry.
 - `BBH` and similar exploratory commands remain explicitly unverified in firmware.
 
 ## Coverage & target-compatibility matrix
+
+> **Anchor:** the 2026‑10‑19 PASS rows below were produced on the **v1.0.0** build. They are not
+> re-established for the current development tree — a 2026‑10‑28 hardware run on it hit repeated
+> `out of memory` crashes (see the memory limit in *Known limits*), so treat the endurance and
+> traversal rows as "passed on v1.0.0", not "passes today".
 
 Radio behaviour is environment- and target-specific, so this project does not publish blanket
 "works everywhere" claims. The matrix below is the **reproducible coverage template**: fill the
@@ -185,8 +201,8 @@ behaviour has been independently RF-verified. Treat RF claims as expectations un
 ### Code-review hardening (2026-10-27)
 
 A full review of the Wi-Fi card firmware found 23 defects. All are fixed; the same fixes are applied
-to the sibling `delfyRTL` tree, whose code was byte-identical. Build-verified only — the RF rows
-above are still open.
+to the sibling `petrel` tree, whose code was byte-identical. Build-verified only — the RF rows above
+are still open.
 
 **Dead code removed.** The legacy Arduino `WiFiServer` path (~120 lines) could never run: `atStart()`
 always sets `webui_mode` or `web_portal_mode`, so its guard was permanently false. `handleRequest`,
@@ -202,8 +218,8 @@ probes, `captive:false` on `/cp.json`, portal rotation, and SSID-derived URLs.
 **Memory safety.** Out-of-bounds read of `deauth_wifis` after any list shrink (`current_num` was
 reset only after the dereference); `strchr` on a non-NUL-terminated pbuf plus a missing
 `len >= 12` guard in the DNS handler; use-after-free in `unbind_all_udp()`; leaked send cursor on
-peer FIN; `TX_RAW_MAX_PAYLOAD` (64) smaller than its own buffer (128), which silently dropped the
-DS Parameter Set from beacons; `PORTAL <n>` without a range check.
+peer FIN; uninitialized `Content-Length`; `TX_RAW_MAX_PAYLOAD` (64) smaller than its own buffer
+(128), which silently dropped the DS Parameter Set from beacons; `PORTAL <n>` without a range check.
 
 **Logic.** `atFail(1)` retried forever and never reached `FAILED` (now capped at 3); `tx_raw_chan_ok`
 accepted the non-channels 15–35; `EVILTWIN START … LIVE` accepted DFS and failed 4 s later; the

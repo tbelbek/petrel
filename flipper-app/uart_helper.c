@@ -45,6 +45,8 @@ typedef struct {
     petrel_dec dec;
     bool in_frame;
     petrel_frame_cb frame_cb;
+
+    bool started;   // worker + RX are started once, by set_callback
 } UartHelper;
 
 /**
@@ -258,16 +260,13 @@ UartHelper* uart_helper_alloc() {
     // The worker thread will then process the data in the ring_buffer, invoking the process_line
     // callback whenever a delimiter is found in the data.
     helper->ring_buffer = ring_buffer_alloc();
+    helper->started = false;
 
     // worker_thread is the routine that will process data from the rx_stream.
     helper->worker_thread =
         furi_thread_alloc_ex("UartHelperWorker", worker_stack_size, uart_helper_worker, helper);
-    furi_thread_start(helper->worker_thread);
-
-    // Set the callback to invoke when data is received.
-    furi_hal_serial_async_rx_start(
-        helper->serial_handle, uart_helper_received_byte_callback, helper, false);
-
+    // The worker and RX are started by uart_helper_set_callback(), after the callbacks and their
+    // context are published: starting them here let a line arrive before either was installed.
     return helper;
 }
 
@@ -283,6 +282,13 @@ void uart_helper_set_callback(UartHelper* helper, ProcessLine process_line, void
     // that for any line that arrived during install).
     helper->context = context;
     helper->process_line = process_line;
+    // Only now is it safe to let the worker and the RX interrupt run.
+    if(!helper->started) {
+        helper->started = true;
+        furi_thread_start(helper->worker_thread);
+        furi_hal_serial_async_rx_start(
+            helper->serial_handle, uart_helper_received_byte_callback, helper, false);
+    }
 }
 
 void uart_helper_set_frame_callback(UartHelper* helper, petrel_frame_cb frame_cb) {

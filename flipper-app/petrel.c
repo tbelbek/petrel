@@ -337,6 +337,7 @@ typedef struct Petrel {
     FuriTimer* scriptTimer;  // F1: advances the SD script engine one step per tick
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
+    uint32_t shot_tick;  // last framebuffer mirror write (throttle)
 } Petrel;
 
 // --- Non-blocking custom-event ring (prioritised plan, item #1) ------------------------------
@@ -367,7 +368,7 @@ static FuriMutex* post_mutex = NULL;
 // 64 records, not 256: this ring is static (.bss), and the FAP's whole budget is small - a 256-slot
 // ring is 8 KB, which together with the 6 KB stack is most of the ~20 KB the device has free. The
 // instrument must not become the problem it is meant to find.
-#define DIAG_N 64
+#define DIAG_N 32
 typedef struct {
     uint32_t seq;
     uint32_t tick;
@@ -383,10 +384,18 @@ static volatile uint32_t diag_head = 0;      // next slot to write
 static volatile uint32_t diag_flushed = 0;   // next slot to persist
 static volatile uint32_t diag_seq = 0;
 static volatile uint32_t diag_dropped = 0;
+// diag() is called from the GUI, the UART worker, the timer and the storage worker, so the
+// reservation and the record write need a lock: two producers could otherwise take the same slot
+// and lose a head/sequence increment. SD I/O stays outside the lock (see diag_flush).
+static FuriMutex* diag_mutex = NULL;
 
 static void diag(uint32_t kind, uint32_t a, uint32_t b) {
+    if(!diag_mutex) return;                 // allocated in app_alloc, freed in app_free
+    furi_mutex_acquire(diag_mutex, FuriWaitForever);
     uint32_t h = diag_head;
-    if(h - diag_flushed >= DIAG_N) diag_dropped++;   // ring full: oldest record is overwritten
+    // The producer never moves diag_flushed (that would race the consumer's increment); the
+    // consumer clamps it on overflow and counts what it had to skip. Counting here instead would
+    // overcount: a record overwritten after being copied into the batch is still persisted.
     DiagRec* r = &diag_ring[h % DIAG_N];
     r->seq = ++diag_seq;
     r->tick = furi_get_tick();
@@ -397,13 +406,31 @@ static void diag(uint32_t kind, uint32_t a, uint32_t b) {
     r->boot_min = (uint32_t)memmgr_get_minimum_free_heap();
     r->largest = (uint32_t)memmgr_heap_get_max_free_block();
     diag_head = h + 1;                                // publish last
+    furi_mutex_release(diag_mutex);
 }
 
 // Persist the ring to the card. Called by the storage worker (batched) and once more from app_free
 // AFTER the worker has been joined: app_free used to stop the worker while the self-test's own
 // completion record was still in the ring, so the record that says the run finished could be lost.
 static void diag_flush(void) {
-    if(diag_flushed == diag_head) return;
+    if(!diag_mutex) return;
+    // Copy a batch out under the lock, then write it with the lock released: a producer never waits
+    // on the SD card.
+    static DiagRec batch[8];   // small: this is BSS, the ring itself is already 2 KB
+    uint32_t n = 0;
+    furi_mutex_acquire(diag_mutex, FuriWaitForever);
+    if(diag_head - diag_flushed > DIAG_N) {                 // skip records that were overwritten
+        diag_dropped += (diag_head - diag_flushed) - DIAG_N;
+        diag_flushed = diag_head - DIAG_N;
+    }
+    while(diag_flushed + n != diag_head && n < 8) {
+        batch[n] = diag_ring[(diag_flushed + n) % DIAG_N];
+        n++;
+    }
+    furi_mutex_release(diag_mutex);
+    if(n == 0) return;
+    // The batch is copied, so the SD writes happen with the lock released: a producer never waits
+    // on card latency. The cursor is advanced afterwards, under the lock, by what was written.
     Storage* dst = furi_record_open(RECORD_STORAGE);
     File* df = storage_file_alloc(dst);
     if(storage_file_open(df, "/ext/petrel/diag.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
@@ -411,16 +438,24 @@ static void diag_flush(void) {
         // buffer, so still no allocation on any thread - and readable straight off the card with the
         // CLI, which mangles binary. Same fields as the binary record.
         char line[96];
-        while(diag_flushed != diag_head) {
-            DiagRec* r = &diag_ring[diag_flushed % DIAG_N];
-            int n = snprintf(
+        uint32_t written = 0;
+        bool short_write = false;
+        for(uint32_t i = 0; i < n; i++) {
+            DiagRec* r = &batch[i];
+            int w = snprintf(
                 line, sizeof(line), "%lu %lu %lu %lu %lu %lu %lu %lu\n",
                 (unsigned long)r->seq, (unsigned long)r->tick, (unsigned long)r->kind,
                 (unsigned long)r->a, (unsigned long)r->b, (unsigned long)r->free_now,
                 (unsigned long)r->boot_min, (unsigned long)r->largest);
-            storage_file_write(df, line, (size_t)n);
-            diag_flushed++;
+            // A short write still counts as consumed: retrying the line would duplicate its prefix
+            // (the file is append-only and cannot be truncated).
+            if(storage_file_write(df, line, (size_t)w) != (size_t)w) { short_write = true; written++; break; }
+            written++;
         }
+        furi_mutex_acquire(diag_mutex, FuriWaitForever);
+        diag_flushed += written;
+        if(short_write) diag_dropped++;
+        furi_mutex_release(diag_mutex);
         storage_file_sync(df);
         storage_file_close(df);
     }
@@ -471,6 +506,14 @@ static char storage_status[64] = "";   // last outcome, for a status screen
 // navigation history without a fixed depth limit, which is what produced "out of memory".
 static volatile uint32_t storage_fail_seq = 0;
 
+// storage_status is written by the storage/UART worker and read by the GUI tick; storage_mutex is
+// only ever held for the queue, so it is free to guard this too.
+#define STORAGE_STATUS(...) do { \
+    furi_mutex_acquire(storage_mutex, FuriWaitForever); \
+    snprintf(storage_status, sizeof(storage_status), __VA_ARGS__); \
+    furi_mutex_release(storage_mutex); \
+} while(0)
+
 // Called from any thread. Takes ownership of data on success; returns false (and the caller frees)
 // when the queue is full, so nothing ever blocks here.
 static bool storage_submit(const char* path, char* data, size_t len, bool append) {
@@ -493,6 +536,39 @@ static bool storage_submit(const char* path, char* data, size_t len, bool append
     return ok;
 }
 
+// --- Ekran yakalama (RPC'siz) -----------------------------------------------------------------
+// Runbook ekran görüntülerini flipctl ile alıyordu; flipctl her komutta bir RPC oturumu açar ve o
+// oturum heap'ten ~20 KB alır (2026-10-28 koşusunda ölçüldü). FAP'in hub'da bıraktığı boş bellek
+// 19 KB olduğu için ekran görüntüsü OOM çökmesine yol açıyordu (C1-C6). Gui'nin framebuffer commit
+// callback'i cihazın çizdiği kareyi doğrudan verir: heap maliyeti yok. Kare 64 karakterlik hex
+// satırları olarak SD'ye yazılır (CLI binary okuyamaz); tools/flip_shot.py PNG'ye çevirir.
+#define SHOT_HEX_PATH "/ext/petrel/shot.hex"
+#define SHOT_BYTES    1024u   // 128x64, 1 bit/piksel, SSD1306 page layout
+
+static void petrel_fb_callback(
+    uint8_t* data,
+    size_t size,
+    CanvasOrientation orientation,
+    void* context) {
+    UNUSED(orientation);
+    Petrel* app = context;
+    if(!app || size < SHOT_BYTES) return;
+    uint32_t now = furi_get_tick();
+    if(now - app->shot_tick < furi_ms_to_ticks(400)) return;   // en fazla ~2.5 kare/sn
+    app->shot_tick = now;
+    char* hex = malloc(2048u + 40u);                           // 2048 hex + satir sonlari
+    if(!hex) return;                                           // yer yoksa sessizce atla
+    static const char* H = "0123456789abcdef";
+    size_t o = 0;
+    for(size_t i = 0; i < SHOT_BYTES; i++) {
+        if(i && (i % 32u) == 0) hex[o++] = '\n';
+        hex[o++] = H[data[i] >> 4];
+        hex[o++] = H[data[i] & 0x0f];
+    }
+    hex[o++] = '\n';
+    if(!storage_submit(SHOT_HEX_PATH, hex, o, false)) free(hex);
+}
+
 // Synchronous, CONFIRMED write for audit evidence. The audit record must be able to state whether
 // the capture actually reached the card (captured != saved - a slow/failed SD must not read as a
 // completed, saved audit). This runs on the UART worker thread, not the GUI thread, so a blocking
@@ -507,16 +583,14 @@ static bool storage_write_now(const char* path, const char* data, size_t len, bo
         size_t w = storage_file_write(fh, data, len);
         ok = (w == len);
         if(ok) {
-            snprintf(storage_status, sizeof(storage_status), "saved %.12s",
-                     strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+            STORAGE_STATUS("saved %.12s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
         } else {
-            snprintf(storage_status, sizeof(storage_status), "SD full? %u/%u bytes",
-                     (unsigned)w, (unsigned)len);
+            STORAGE_STATUS("SD full? %u/%u bytes", (unsigned)w, (unsigned)len);
             storage_fail_seq++;
         }
         storage_file_close(fh);
     } else {
-        snprintf(storage_status, sizeof(storage_status), "no SD / open failed");
+        STORAGE_STATUS("no SD / open failed");
         storage_fail_seq++;
     }
     storage_file_free(fh);
@@ -562,18 +636,17 @@ static int32_t storage_worker(void* context) {
             size_t w = storage_file_write(f, job.data, job.len);
             if(w != job.len) {
                 // Short write: the card may be full. Say so instead of pretending it saved.
-                snprintf(storage_status, sizeof(storage_status), "SD full? %u/%u bytes",
-                         (unsigned)w, (unsigned)job.len);
+                STORAGE_STATUS("SD full? %u/%u bytes", (unsigned)w, (unsigned)job.len);
                 storage_fail_seq++;
                 FURI_LOG_E(TAG, "storage short write %s %u/%u", job.path, (unsigned)w,
                            (unsigned)job.len);
             } else {
-                snprintf(storage_status, sizeof(storage_status), "saved %.12s",
-                         strrchr(job.path, '/') ? strrchr(job.path, '/') + 1 : job.path);
+                STORAGE_STATUS("saved %.12s",
+                               strrchr(job.path, '/') ? strrchr(job.path, '/') + 1 : job.path);
             }
             storage_file_close(f);
         } else {
-            snprintf(storage_status, sizeof(storage_status), "no SD / open failed");
+            STORAGE_STATUS("no SD / open failed");
             storage_fail_seq++;
             FURI_LOG_E(TAG, "storage open failed %s", job.path);
         }
@@ -1128,8 +1201,21 @@ static void petrel_save_scan(const char* kind, const char* body) {
 static void petrel_save_wifi_list(Petrel* app) {
     if(app->wifiCount <= 0) return;
     size_t cap = (size_t)app->wifiCount * 96u + 1u;
+    // Heap guard (2026-10-28 hardware run): this path holds TWO buffers of ~cap at once - the body
+    // here and the header+body copy inside petrel_save_scan(). With 48 APs that is ~9.2 KB, and it
+    // lands exactly when the scan results finish arriving. With a flipctl RPC session holding ~18 KB
+    // the Flipper OOM-crashed here and rebooted. Dropping the save keeps the results on screen.
+    if(memmgr_heap_get_max_free_block() < cap + 512u) {
+        diag(44, (uint32_t)cap, (uint32_t)memmgr_heap_get_max_free_block());
+        STORAGE_STATUS("low memory: list not saved");
+        storage_fail_seq++;
+        return;
+    }
     char* buf = malloc(cap);
-    if(!buf) return;
+    if(!buf) {
+        diag(44, (uint32_t)cap, 0);   /* malloc failed despite the guard */
+        return;
+    }
     buf[0] = '\0';
     for(int i = 0; i < app->wifiCount; i++) {
         char line[112];
@@ -2228,11 +2314,15 @@ static void portal_list_load(void) {
 static void petrel_load_portal_file(Petrel* app, const char* name) {
     char path[96];
     snprintf(path, sizeof(path), "/ext/petrel/portals/%s", name);
-    // ponytail: 8 KB read buffer on demand, not resident BSS. The FAP idles at ~19 KB free heap and
-    // this buffer lived for the whole session while only being used here (portal load never overlaps
-    // a recon scan) - moving it off BSS gives recon result scenes the headroom they were OOM-crashing
+    // ponytail: read buffer on demand, not resident BSS. The FAP idles at ~19 KB free heap and this
+    // buffer lived for the whole session while only being used here (portal load never overlaps a
+    // recon scan) - moving it off BSS gives recon result scenes the headroom they were OOM-crashing
     // the whole Flipper for (B2). Fragmentation-safe: at idle largest free block ~= free heap.
-    uint8_t* buf = malloc(6144);   // board-side customPortal cap
+    // PORTAL_MAX: the board's customPortal is 6144 bytes and reserves one for the terminator, so a
+    // 6144-byte file would upload short and fail the hash check. Cap at 6143 and refuse longer files
+    // instead of truncating them silently.
+#define PORTAL_MAX 6143
+    uint8_t* buf = malloc(PORTAL_MAX);
     if(!buf) {
         snprintf(message, sizeof(message), "Low memory");
         snprintf(popupHeader, sizeof(popupHeader), "Portal");
@@ -2242,12 +2332,21 @@ static void petrel_load_portal_file(Petrel* app, const char* name) {
     Storage* st = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(st);
     size_t n = 0;
+    bool too_big = false;
     if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        n = storage_file_read(f, buf, 6144);
+        too_big = storage_file_size(f) > PORTAL_MAX;
+        if(!too_big) n = storage_file_read(f, buf, PORTAL_MAX);
         storage_file_close(f);
     }
     storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+    if(too_big) {
+        free(buf);
+        snprintf(message, sizeof(message), "Too big (max %d B)", PORTAL_MAX);
+        snprintf(popupHeader, sizeof(popupHeader), "Portal");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
     if(n == 0) {
         free(buf);
         snprintf(message, sizeof(message), "Failed to read");
@@ -2520,7 +2619,26 @@ static void petrel_badble_run(Petrel* app) {
 static void wifi_hub_cb(void* context, uint32_t index) {
     Petrel* app = context;
     switch(index) {
-    case 0: scene_manager_next_scene(app->scene_manager, scanNetworksScene); break;
+    case 0:
+        // Heap guard (2026-10-28 hardware run). Checked HERE, before the scene is pushed: entering
+        // a scene transiently costs ~20 KB on this FAP (the incoming view's buffers are allocated
+        // before the outgoing one's are released), so a check inside scan_networks_scene_on_enter
+        // always saw the transient floor and refused every scan. At the observed floor during a
+        // scan start (free ~4.8 KB, largest block ~1.7 KB) the busy path OOM-crashed the Flipper.
+        if(memmgr_get_free_heap() < 8192 || memmgr_heap_get_max_free_block() < 4096) {
+            diag(41, (uint32_t)memmgr_get_free_heap(),
+                 (uint32_t)memmgr_heap_get_max_free_block()); /* scan refused: low heap */
+            snprintf(popupHeader, sizeof(popupHeader), "Low memory");
+            snprintf(
+                message,
+                sizeof(message),
+                "%lu B free. Reboot, then scan.",
+                (unsigned long)memmgr_get_free_heap());
+            post_event(app, PETREL_EVT_POPUP);
+            break;
+        }
+        scene_manager_next_scene(app->scene_manager, scanNetworksScene);
+        break;
     case 1: scene_manager_next_scene(app->scene_manager, listNetworksScene); break;
     case 2: scene_manager_next_scene(app->scene_manager, channelMapScene); break;
     case 3: scene_manager_next_scene(app->scene_manager, configAPScene); break;
@@ -2552,9 +2670,15 @@ static void petrel_ident(Petrel* app) {
     // Bounded (architect): at most three attempts, 3 s apart, and never again once identified. The
     // previous version retried forever while fw_caps stayed empty - every 3 s, for the whole session,
     // and each call oscillated the free heap by ~6 KB, which is what made allocations fail later.
-    if(app->fw_caps[0] != '\0' || app->ident_attempts >= 3) return;
+    // 2026-10-28: keep trying, slowly, instead of giving up after three. The board now re-arms its
+    // Serial1 after 10 s of silence (firmware self-heal), so a link that died in a Flipper reboot
+    // comes back on its own — but only if the app is still asking. 3 quick tries at boot, then one
+    // every 10 s (capped at 20 so an absent board cannot churn the heap forever).
+    if(app->fw_caps[0] != '\0' || app->ident_attempts >= 20) return;
     uint32_t now = furi_get_tick();
-    if(app->ident_attempts != 0 && (uint32_t)(now - app->ident_last_tick) < furi_ms_to_ticks(3000))
+    uint32_t ident_gap_ms = (app->ident_attempts < 3) ? 3000u : 10000u;
+    if(app->ident_attempts != 0 &&
+       (uint32_t)(now - app->ident_last_tick) < furi_ms_to_ticks(ident_gap_ms))
         return;
     app->ident_last_tick = now;
     app->ident_attempts++;
@@ -2578,6 +2702,7 @@ static void petrel_send_portal_sel(Petrel* app) {
 
 void wifi_hub_scene_on_enter(void* context) {
     Petrel* app = context;
+
     // Self-heal "unidentified": the 3 startup IDENT attempts all land in the ~9s UART warm-up right
     // after launch, when the board never receives the HELLO (confirmed: board silent during that
     // window), so the app gives up forever and the Tools menu stays capability-gated to a stub. The
@@ -5218,22 +5343,24 @@ static void uart_enqueue_line(FuriString* line, void* context) {
 // M0.3: decoded DP_SCAN_AP frame -> reformat to the canonical "AP:" line and enqueue on the SAME
 // GUI-thread queue the ASCII path uses. wifiList therefore stays written only on the GUI thread (no
 // worker-vs-GUI race, per the wifiList comments) and the existing AP: parser handles it unchanged.
-// Runs on the UART worker thread. Payload: idx|total|bssid[6]|ch|sec|rssi(i16 LE)|ssid_len|ssid.
+// Runs on the UART worker thread. Payload: idx|total|bssid[6]|ch|sec(u32 LE)|rssi(i16 LE)|ssid_len|ssid.
 static void petrel_scan_frame(uint8_t type, const uint8_t* p, uint16_t len, void* context) {
     Petrel* app = context;
     if(type != DP_SCAN_AP || len < 2) return;
     uint8_t idx = p[0];
     uint8_t total = p[1];
     if(total == 0) return; // empty-list marker, nothing to add
-    if(len < 13) return; // idx,total,bssid[6],ch,sec,rssi(2) = 12, then ssid_len at [12]
-    uint8_t sl = p[12];
+    if(len < 16) return; // idx,total,bssid[6],ch,sec(4),rssi(2) = 15, then ssid_len at [15]
+    uint8_t sl = p[15];
     if(sl > 32) sl = 32;
-    if(len < (uint16_t)(13 + sl)) return;
-    int16_t rssi = (int16_t)((uint16_t)p[10] | ((uint16_t)p[11] << 8));
+    if(len < (uint16_t)(16 + sl)) return;
+    int16_t rssi = (int16_t)((uint16_t)p[13] | ((uint16_t)p[14] << 8));
+    uint32_t sec = (uint32_t)p[9] | ((uint32_t)p[10] << 8) | ((uint32_t)p[11] << 16) |
+                   ((uint32_t)p[12] << 24);
     // Sanitise SSID to printable, non-'|' so a binary SSID cannot corrupt the '|'-delimited AP: line.
     char ssid[33];
     for(uint8_t i = 0; i < sl; i++) {
-        char c = (char)p[13 + i];
+        char c = (char)p[16 + i];
         ssid[i] = (c >= 0x20 && c < 0x7f && c != '|') ? c : '?';
     }
     ssid[sl] = '\0';
@@ -5246,7 +5373,7 @@ static void petrel_scan_frame(uint8_t type, const uint8_t* p, uint16_t len, void
         ssid,
         p[2], p[3], p[4], p[5], p[6], p[7],
         (unsigned)p[8],
-        (unsigned)p[9],
+        (unsigned)sec,
         (int)rssi);
     FuriString* fs = furi_string_alloc_set_str(linebuf);
     uart_enqueue_line(fs, app); // copies into the GUI queue; parsed into wifiList there
@@ -5331,7 +5458,9 @@ static void uart_gui_tick(void* context) {
     static uint32_t storage_seen = 0;
     if(storage_fail_seq != storage_seen) {
         storage_seen = storage_fail_seq;
+        furi_mutex_acquire(storage_mutex, FuriWaitForever);
         snprintf(message, sizeof(message), "%s", storage_status);
+        furi_mutex_release(storage_mutex);
         snprintf(popupHeader, sizeof(popupHeader), "SD problem");
         post_event(app, PETREL_EVT_POPUP);
     }
@@ -5602,18 +5731,26 @@ void uart_process_line(FuriString* line, void* context) {
         // A6: classify "<mac>|<ssid>|akm=N|sae=N|mfp=cap|req" into a WPA3/WPA2 verdict so the
         // recon view reads like an inventory (and transition-mode downgrades stand out).
         const char* s = furi_string_get_cstr(line) + 4;
+        // Metadata starts after the SSID field: an SSID containing "mfp=req" must not override the
+        // real value, so search only past the second '|'.
+        const char* meta = s;
+        for(int f = 0; f < 2 && meta; f++) {
+            meta = strchr(meta, '|');
+            if(meta) meta++;
+        }
+        if(!meta) meta = s + strlen(s);
         if(audit_mode && audit_phase == AUDIT_PHASE_PMF) {
             // Audit PMF scan: capture only the target AP's PMF posture; skip recon_append so the
             // other on-channel APs don't pollute recon_text (a cancelled fall-through shows it).
             if(audit_bssid_valid && pmf_line_is_target(s)) {
                 audit_pmf_seen = true;
-                const char* m = strstr(s, "mfp=");
+                const char* m = strstr(meta, "mfp=");
                 audit_pmf_req = m && !strncmp(m + 4, "req", 3);
             }
             return;
         }
-        const char* sae = strstr(s, "sae=");
-        const char* mfp = strstr(s, "mfp=");
+        const char* sae = strstr(meta, "sae=");
+        const char* mfp = strstr(meta, "mfp=");
         int sae_v = sae ? atoi(sae + 4) : 0;
         const char* cls;
         if(sae_v && mfp && !strncmp(mfp + 4, "req", 3)) {
@@ -5901,6 +6038,8 @@ static Petrel* app_alloc() {
     post_tail = 0;
     post_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(post_mutex);
+    diag_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(diag_mutex);
     // Storage worker first, so any line that arrives once the UART worker starts already has
     // somewhere to hand its snapshot.
     storage_head = 0;
@@ -6064,8 +6203,10 @@ static Petrel* app_alloc() {
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
     uart_helper_set_delimiter(app->uart_helper, LINE_DELIMITER, INCLUDE_LINE_DELIMITER);
-    uart_helper_set_callback(app->uart_helper, uart_enqueue_line, app);
+    // Frame callback first: set_callback() is what starts the worker and RX, so installing it
+    // afterwards left a window where binary frames were dropped.
     uart_helper_set_frame_callback(app->uart_helper, petrel_scan_frame); // M0.3: DP_SCAN_AP side-channel
+    uart_helper_set_callback(app->uart_helper, uart_enqueue_line, app);
     petrel_ident(app); // A: ask the board to advertise caps (bounded, see petrel_ident)
 
     app->timer = furi_timer_alloc(animation_timer_callback, FuriTimerTypePeriodic, app);
@@ -6108,6 +6249,15 @@ static void app_free(Petrel* app) {
     // uart_helper_free, and the dispatcher's tick can no longer fire because its loop returned).
     // Stop the storage worker BEFORE anything else is torn down. Its queue is drained and freed
     // here rather than waited on: pending jobs are dropped, never awaited forever.
+    // Let the worker finish what it already accepted (bounded): closing used to free queued
+    // captures/reports without writing them or saying so.
+    for(int i = 0; i < 500; i++) {
+        furi_mutex_acquire(storage_mutex, FuriWaitForever);
+        bool empty = (storage_tail == storage_head);
+        furi_mutex_release(storage_mutex);
+        if(empty) break;
+        furi_delay_ms(10);
+    }
     storage_run = false;
     if(storage_thread) {
         furi_thread_join(storage_thread);
@@ -6117,7 +6267,7 @@ static void app_free(Petrel* app) {
     // Producers are stopped (every timer above, the UART worker in uart_helper_free, the tick loop
     // has returned), so this is the last word: flush whatever is still in the ring, including the
     // self-test's completion record, instead of leaving it to be freed unseen.
-    diag_flush();
+    for(int i = 0; i < 50 && diag_flushed != diag_head; i++) diag_flush();   // drain the whole ring
     furi_mutex_acquire(storage_mutex, FuriWaitForever);
     while(storage_tail != storage_head) {
         free(storage_q[storage_tail].data);
@@ -6127,6 +6277,8 @@ static void app_free(Petrel* app) {
     furi_mutex_free(storage_mutex);
     storage_mutex = NULL;
     furi_mutex_free(post_mutex);
+    furi_mutex_free(diag_mutex);
+    diag_mutex = NULL;
     post_mutex = NULL;
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
@@ -6242,6 +6394,8 @@ int32_t Petrel_app(void* p) {
     expansion_disable(expansion);
     if(!furi_hal_power_is_otg_enabled()) furi_hal_power_enable_otg();
     Gui* gui = furi_record_open(RECORD_GUI);
+    // RPC'siz ekran goruntusu: her kare /ext/petrel/shot.hex'e yazilir (tools/flip_shot.py PNG'ye cevirir).
+    gui_add_framebuffer_callback(gui, petrel_fb_callback, app);
     view_dispatcher_attach_to_gui(app->view_dispatcher, gui, ViewDispatcherTypeFullscreen);
     scene_manager_next_scene(app->scene_manager, mainMenuScene);
     // Deterministic diagnostic entry point (architect, D.5): start the self-test from the app
@@ -6256,6 +6410,7 @@ int32_t Petrel_app(void* p) {
         diag(7, 1u, (uint32_t)ST_LAPS);
     }
     view_dispatcher_run(app->view_dispatcher);
+    gui_remove_framebuffer_callback(gui, petrel_fb_callback, app);
 
     app_free(app);
     expansion_enable(expansion);

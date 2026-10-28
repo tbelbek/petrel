@@ -294,8 +294,8 @@ def file_checksum(data):
         checksum = (checksum + word) & 0xFFFFFFFF
 
     if remainder > 0:
-        last_word = struct.unpack_from("<I", data, n_words * 4)[0] if n_words * 4 + 4 <= len(data) + 4 else 0
-        # Read remaining bytes
+        # Only the tail bytes exist; the old unpack_from() read four bytes past the end for any
+        # partial word (the condition was always true) and raised struct.error.
         last_bytes = data[n_words * 4:]
         padded = last_bytes + b'\x00' * (4 - len(last_bytes))
         last_word = struct.unpack("<I", padded)[0]

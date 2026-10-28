@@ -57,7 +57,7 @@ docker run --rm --platform linux/amd64 \
     cp -r /sketch "/tmp/$INO"
     # M0.2: Arduino only includes sketch-local headers, so drop the shared transport header
     # (canonical in repo common/) into the sketch copy. Single source, copied in at build.
-    cp /common/petrel_proto.h /common/wids.h "/tmp/$INO/"
+    cp /common/petrel_proto.h /common/wids.h /common/petrel_http.h "/tmp/$INO/"
     echo "=== compiling $INO ==="
     arduino-cli compile --fqbn "$FQBN" --output-dir /out --build-path /out/build -v "/tmp/$INO" 2>&1 \
       | grep -iE "postbuild|img2|image2|km0_km4|error|undefined|reference to|overflow|region|ld:|warning:|Sketch uses|\.bin" | tail -30

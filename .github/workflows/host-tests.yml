@@ -1,0 +1,29 @@
+name: host tests
+
+# The firmware itself needs the AmebaD toolchain, but the pure logic does not. These tests cover the
+# parts that are easy to break and impossible to unit-test once they sit in a .cpp that needs lwIP.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and run host tests
+        run: |
+          set -e
+          run() { echo "== $1"; shift; "$@"; }
+          cc -O2 -Wall -Wextra -Werror -I common -o /tmp/t_http common/petrel_http_test.c
+          /tmp/t_http
+          cc -O2 -Wall -Wextra -I common -o /tmp/t_cq common/petrel_capture_quality.c common/petrel_capture_quality_test.c
+          /tmp/t_cq
+          cc -O2 -Wall -Wextra -I common -o /tmp/t_proto common/petrel_proto_test.c
+          /tmp/t_proto
+          cc -O2 -Wall -Wextra -I common -o /tmp/t_wids common/wids_test.c
+          /tmp/t_wids
+          cc -O2 -Wall -Wextra -I common -I flipper-app -o /tmp/t_audit common/petrel_audit_method_test.c
+          /tmp/t_audit
+          cc -O2 -Wall -Wextra -I RTL8720dn-firmware -o /tmp/t_dhcp firmware-build/test_dhcp_build.c
+          /tmp/t_dhcp

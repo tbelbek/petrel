@@ -27,12 +27,12 @@ By using Petrel you confirm you are operating within a lawful, authorized scope.
 
 ## Features
 
-- **Dual-band scan** — 2.4 **and 5 GHz** APs with signal, channel, encryption, **PMF / WPA3 detection**,
-  RSSI sorting and same-SSID mesh markers.
+- **Dual-band scan** — 2.4 **and 5 GHz** APs with signal, channel, encryption, **PMF / WPA3 detection**
+  and RSSI sorting.
 - **Channel map / analyzer** across both bands.
 - **Handshake capture → PCAP** and **PMKID** (incl. clientless) with **exchange-aware capture validation**
   (matches BSSID / station / replay counter — not just message presence).
-- **BLE reconnaissance** — scanner, tracker detection (AirTag / Tile / SmartTag / Find My), GATT service
+- **BLE reconnaissance** — scanner with vendor tagging (Apple / Find My / Microsoft), GATT service
   enumeration, iBeacon broadcast.
 - **WIDS** — passive deauthentication / disassociation detection.
 - Dual-use Wi-Fi primitives (deauth, beacon/probe tooling, captive-portal demo, KARMA, floods) — see the
@@ -74,6 +74,13 @@ bash firmware-build/build_petrel.sh "$PWD/RTL8720dn-firmware" "$PWD/firmware-bui
 ```bash
 cd flipper-app && ufbt            # builds dist/petrelrtl.fap
 ufbt launch                       # install + launch on a connected Flipper
+```
+
+**Host tooling** (`tools/`) needs `pyserial` (`python3 -m venv .venv && .venv/bin/pip install pyserial`).
+Screen capture without an RPC session — the FAP mirrors every frame to `/ext/petrel/shot.hex`, so the
+20 KB an RPC session (`flipctl`/qFlipper) would take never goes missing:
+```bash
+python3 tools/flip_shot.py shot.png
 ```
 
 ---

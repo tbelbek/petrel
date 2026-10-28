@@ -34,7 +34,8 @@ typedef struct {
     uint8_t  ssid_churn;  /* beacon: distinct-SSID changes on this BSSID (KARMA responder) */
     uint16_t ssid_hash;   /* beacon: FNV-1a16 of SSID */
     uint16_t win_count;   /* deauth: frames in the current window */
-    uint32_t win_start;   /* deauth: window start; beacon: reused as last-seen (for LRU) */
+    uint32_t deauth_win;  /* deauth: window start (separate from the beacon last-seen below) */
+    uint32_t win_start;   /* beacon: last-seen, used for LRU eviction */
     uint32_t last_alert;  /* debounce */
 } wids_slot_t;
 
@@ -75,7 +76,9 @@ static wids_slot_t* wids_slot(wids_state* s, const uint8_t* key, int* is_new) {
 /* A deauth/disassoc frame from `src` at time `now`. Returns WIDS_DEAUTH_FLOOD (debounced) or 0. */
 static int wids_feed_deauth(wids_state* s, const uint8_t* src, uint32_t now) {
     wids_slot_t* sl = wids_slot(s, src, 0);
-    if (now - sl->win_start > WIDS_DEAUTH_WIN_MS) { sl->win_start = now; sl->win_count = 0; }
+    /* Own window: a beacon from the same MAC used to reset it through the shared field, so sparse
+     * deauth frames could accumulate to the threshold over an arbitrarily long period. */
+    if (now - sl->deauth_win > WIDS_DEAUTH_WIN_MS) { sl->deauth_win = now; sl->win_count = 0; }
     sl->win_count++;
     if (sl->win_count >= WIDS_DEAUTH_THRESH &&
         (sl->last_alert == 0 || now - sl->last_alert > WIDS_DEBOUNCE_MS)) {
