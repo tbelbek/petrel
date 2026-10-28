@@ -37,7 +37,16 @@ static unsigned g_sends = 0;   // responses currently streaming (their body poin
 // so tcp_err can always untrack even when no response has started yet. A stop aborts every record -
 // closing the listener alone would leave connections running against state the next start resets.
 #define WEB_CONNS 4
-struct web_conn { struct tcp_pcb* pcb; struct web_send* ws; };
+struct web_conn {
+    struct tcp_pcb* pcb;
+    struct web_send* ws;
+    // 2026-10-28: the request line used to be copied out of the FIRST pbuf only, and the rest of
+    // the chain was freed. When TCP delivered "GET /userinput?..." split across pbufs the query
+    // silently vanished - the page was served, the submission was never captured. Same HTTP bytes
+    // therefore behaved differently run to run. Accumulate here until the line is complete.
+    char req[160];   // one request line; headers are never needed
+    uint16_t req_len;
+};
 // 2026-10-28: these records used to be mem_malloc'd. Serving a portal page hard-locked the board
 // right after web_finish(), and the fix has to be structural: a second free of the same record
 // corrupts the lwIP heap and takes the whole board down (no UART, AP dead). Records now live in a
@@ -50,7 +59,7 @@ static struct web_conn* conn_add(struct tcp_pcb* p) {
     for (unsigned i = 0; i < WEB_CONNS; i++) {
         if (!g_conns[i]) {
             struct web_conn* c = &g_conn_pool[i];
-            c->pcb = p; c->ws = NULL;
+            c->pcb = p; c->ws = NULL; c->req_len = 0; c->req[0] = 0;
             g_conns[i] = c;
             return c;
         }
@@ -281,12 +290,24 @@ static err_t web_recv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t err
     // re-enter: it would restart the response and leak the cursor. Just drain it.
     if (c && c->ws) { tcp_recved(tpcb, p->tot_len); pbuf_free(p); return ERR_OK; }
 
-    // copy the request line out of the FIRST pbuf before freeing (most GETs fit one segment)
-    char req[200];
-    u16_t rl = p->len < (u16_t)(sizeof(req) - 1) ? p->len : (u16_t)(sizeof(req) - 1);
-    memcpy(req, p->payload, rl); req[rl] = 0;
+    // Accumulate until the request line is complete. Copying only the first pbuf truncated the
+    // path whenever the request was split, which lost the query string (and with it the capture).
+    if (!c) { tcp_recved(tpcb, p->tot_len); pbuf_free(p); web_finish(tpcb, NULL); return ERR_OK; }
+    {
+        uint16_t space = (uint16_t)(sizeof(c->req) - 1 - c->req_len);
+        uint16_t want = p->tot_len < space ? p->tot_len : space;
+        if (want) c->req_len += pbuf_copy_partial(p, c->req + c->req_len, want, 0);
+        c->req[c->req_len] = 0;
+    }
     tcp_recved(tpcb, p->tot_len);
     pbuf_free(p);
+    if (!memchr(c->req, '\n', c->req_len)) {
+        // Incomplete line: wait for the next segment. Oversized junk is dropped so a peer cannot
+        // pin the buffer forever.
+        if (c->req_len >= (uint16_t)(sizeof(c->req) - 1)) { c->req_len = 0; c->req[0] = 0; }
+        return ERR_OK;
+    }
+    char* req = c->req;
 
     if (!web_portal) {
         // --- WebUI mode: serve the render() status page to any request ---

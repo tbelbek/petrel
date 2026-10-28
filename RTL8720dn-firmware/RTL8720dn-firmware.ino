@@ -2414,6 +2414,14 @@ static void apTestTick()
             atFail(3);   // the worker has finished its radio access: cleanup is safe
         } else if (r == 1) {
             petrel_radio_cache(atRadioTarget);   // only after a CONFIRMED ON
+            // 2026-10-28: raise the SoftAP station table once the radio is confirmed up (calling it
+            // before wifi_on returns ioctl -1 and aborts bring-up). Reconnects were rejected after
+            // the first client session left; the table is where that state lives.
+            if(atWantStart) {
+                extern int wext_set_sta_num(unsigned char ap_sta_num);
+                int sn = wext_set_sta_num(8);
+                if(sn != 0) { char sm[40]; snprintf(sm, sizeof(sm), "APTEST:STANUM rc=%d", sn); Serial.println(sm); }
+            }
             atEnter(AT_ON_GAP);
         }
         return;

@@ -5529,6 +5529,14 @@ static void uart_gui_tick(void* context) {
     }
 }
 
+/*TXD: first 16 bytes of every board command (two diag records) to compare sequences*/
+void petrel_tx_probe(const char* s, size_t n) {
+    uint32_t w[4] = {0, 0, 0, 0};
+    for(int i = 0; i < 16 && i < (int)n; i++) w[i / 4] |= (uint32_t)(uint8_t)s[i] << (8 * (i % 4));
+    diag(51, w[0], w[1]);
+    diag(52, w[2], w[3]);
+}
+
 void uart_process_line(FuriString* line, void* context) {
     diag(17, (uint32_t)furi_string_size(line), 0);   // input line size
     FURI_LOG_D(TAG, __func__);
