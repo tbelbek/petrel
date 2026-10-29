@@ -68,7 +68,7 @@ test — this project does not ship demonstrated‑impact claims for them.
 | Auth flood | 2.4 + 5 | Implemented |
 | Assoc+sleep flood | 2.4 + 5 | Implemented |
 | SAE / Dragonblood commit flood (WPA3) | 2.4 + 5 | Experimental |
-| Eviltwin / captive portal (SoftAP) | 2.4 (HW‑verified) · 5 (SoftAP HW‑verified ch36/149) | Implemented |
+| Eviltwin / captive portal (SoftAP) | 2.4 (HW‑verified) · 5 (SoftAP HW‑verified ch36/149) | **HW‑verified** — page serve, form submit, `EV:` on both UARTs, FAP *Captured data* screen and `/ext/petrel/sessions/<id>/creds.txt`, all six portal templates, 11 submits in a row without a freeze (2026‑10‑29) |
 | Raw beacon / probe flood | 2.4 + 5 | HW‑verified (TX path, ch36 + ch149) |
 
 Real‑brand credential‑capture portals are **not** in this repository (neutral Default page only);
