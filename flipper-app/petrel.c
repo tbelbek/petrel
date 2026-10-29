@@ -3083,7 +3083,9 @@ static void selftest_step(Petrel* app) {
             app->scan_waiting = false;
             st_active = false;
             diag(19, 99u, 1u);   // self-test failure: scan completion never arrived
-            view_dispatcher_stop(app->view_dispatcher);
+            snprintf(popupHeader, sizeof(popupHeader), "%s", "Self-test");
+            snprintf(message, sizeof(message), "%s", "FAIL: step timeout\n");
+            post_event(app, PETREL_EVT_POPUP);
         }
         return;
     }
@@ -3093,7 +3095,11 @@ static void selftest_step(Petrel* app) {
     if(st_lap >= ST_LAPS) {
         st_active = false;
         diag(9, (uint32_t)st_lap, diag_dropped);
-        view_dispatcher_stop(app->view_dispatcher);
+        // 2026-10-29: finishing used to call view_dispatcher_stop(), i.e. CLOSE the app with no
+        // result - indistinguishable from the old failure. Report the pass and stay in the app.
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Self-test");
+        snprintf(message, sizeof(message), "PASS: %u laps\n", (unsigned)ST_LAPS);
+        post_event(app, PETREL_EVT_POPUP);
         return;
     }
 
@@ -3104,7 +3110,9 @@ static void selftest_step(Petrel* app) {
     if((scene == mainMenuScene && root_below) || (scene != mainMenuScene && !root_below)) {
         st_active = false;
         diag(19, scene, 1u);   // self-test failure: root invariant
-        view_dispatcher_stop(app->view_dispatcher);
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Self-test");
+        snprintf(message, sizeof(message), "FAIL: scene %u\n", (unsigned)scene);
+        post_event(app, PETREL_EVT_POPUP);
         return;
     }
 
@@ -3128,7 +3136,9 @@ static void selftest_step(Petrel* app) {
         if(!scene_manager_previous_scene(app->scene_manager)) {
             st_active = false;
             diag(19, scene, 2u);   // self-test failure: unexpected empty stack
-            view_dispatcher_stop(app->view_dispatcher);
+            snprintf(popupHeader, sizeof(popupHeader), "%s", "Self-test");
+            snprintf(message, sizeof(message), "%s", "FAIL: scene stack\n");
+            post_event(app, PETREL_EVT_POPUP);
             return;
         }
         break;
