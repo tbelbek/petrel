@@ -509,6 +509,7 @@ static volatile uint32_t storage_fail_seq = 0;
 // Binary scan list: the board sends idx/total in every DP_SCAN_AP frame, so the GUI thread knows
 // when the whole list has been parsed and can persist it without waiting for the user to open List Wifi.
 static volatile uint8_t scan_expect_total = 0;
+static uint8_t scan_seen_idx[WIFI_MAX];   // per-list index de-duplication (GUI thread only)
 
 // storage_status is written by the storage/UART worker and read by the GUI tick; storage_mutex is
 // only ever held for the queue, so it is free to guard this too.
@@ -535,6 +536,10 @@ static bool storage_submit(const char* path, char* data, size_t len, bool append
         ok = true;
     } else {
         storage_dropped++;
+        // 2026-10-29: a full queue was silent. Publish it through the same failure mechanism the
+        // worker uses so the popup reports the loss instead of only the session-summary counter.
+        snprintf(storage_status, sizeof(storage_status), "save queue full");
+        storage_fail_seq++;
     }
     furi_mutex_release(storage_mutex);
     return ok;
@@ -610,7 +615,10 @@ static bool storage_write_now(const char* path, const char* data, size_t len, bo
 
 static int32_t storage_worker(void* context) {
     UNUSED(context);
-    while(storage_run) {
+    // 2026-10-29: exit only when shutdown was requested AND the queue is empty. The old loop tested
+    // only the flag, so jobs accepted just before teardown were never written and were freed -
+    // silent loss of capture evidence.
+    for(;;) {
         StorageJob job = {0};
         bool have = false;
         furi_mutex_acquire(storage_mutex, FuriWaitForever);
@@ -618,6 +626,9 @@ static int32_t storage_worker(void* context) {
             job = storage_q[storage_tail];
             storage_tail = (uint8_t)((storage_tail + 1) % STORAGE_Q);
             have = true;
+        } else if(!storage_run) {
+            furi_mutex_release(storage_mutex);
+            break;
         }
         furi_mutex_release(storage_mutex);
         if(!have) {
@@ -906,8 +917,9 @@ static void hs_write_pcap(const char* path, uint16_t* out_frames, bool* out_save
             free(snap);
         } else {
             // out_frames reports what was QUEUED; the worker logs the real outcome (short write vs
-            // saved) separately - see storage_status.
-            if(!storage_submit(path, snap, off, false)) free(snap);
+            // saved) separately - see storage_status. A rejected submission queued nothing, so it
+            // must not claim frames were written.
+            if(!storage_submit(path, snap, off, false)) { free(snap); written = 0; }
         }
     }
     if(out_frames) *out_frames = written;
@@ -2650,6 +2662,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
             break;
         }
         scan_expect_total = 0;   // never inherit the previous list's total
+        memset(scan_seen_idx, 0, sizeof(scan_seen_idx));
         if(memmgr_get_free_heap() < 8192 || memmgr_heap_get_max_free_block() < 4096) {
             diag(41, (uint32_t)memmgr_get_free_heap(),
                  (uint32_t)memmgr_heap_get_max_free_block()); /* scan refused: low heap */
@@ -5440,10 +5453,14 @@ static void petrel_scan_frame(uint8_t type, const uint8_t* p, uint16_t len, void
         (unsigned)p[8],
         (unsigned)sec,
         (int)rssi);
+    // 2026-10-29: the total travels WITH the record. Publishing it after enqueueing let the GUI
+    // parse the last AP, save and clear the total, and then have the worker republish it - a second
+    // save of the same list. Only the GUI parser touches scan_expect_total now.
+    size_t ln = strlen(linebuf);
+    snprintf(linebuf + ln, sizeof(linebuf) - ln, "|%u", (unsigned)total);
     FuriString* fs = furi_string_alloc_set_str(linebuf);
     uart_enqueue_line(fs, app); // copies into the GUI queue; parsed into wifiList there
     furi_string_free(fs);
-    scan_expect_total = total;   // GUI thread persists the list once it has parsed this many APs
 }
 
 // Dispatcher thread: drain what the worker queued, and finish the scan wait. One line per call so
@@ -5632,8 +5649,8 @@ void uart_process_line(FuriString* line, void* context) {
         // 2026-10-29: split on '|' PRESERVING empty fields. A hidden AP arrives as
         // "AP:0||BSSID|ch|sec|rssi"; petrel_strtok skips consecutive delimiters, so the SSID slot
         // swallowed the BSSID and every later field shifted (the record was then dropped).
-        char* f[6]; int nf = 0; char* p = buffer + 3;
-        while(nf < 6) {
+        char* f[7]; int nf = 0; char* p = buffer + 3;
+        while(nf < 7) {
             f[nf++] = p;
             char* bar = strchr(p, '|');
             if(!bar) break;
@@ -5641,8 +5658,16 @@ void uart_process_line(FuriString* line, void* context) {
             p = bar + 1;
         }
         if(nf < 6) return;
+        // 2026-10-29: an index can repeat (a re-sent frame). Counting records instead of distinct
+        // indices satisfied the completion condition without every AP having arrived.
+        int id = atoi(f[0]);
+        if(id >= 0 && id < WIFI_MAX) {
+            if(scan_seen_idx[id]) return;
+            scan_seen_idx[id] = 1;
+        }
+        if(nf >= 7) scan_expect_total = (uint8_t)atoi(f[6]);   // GUI thread only
         APDetails* newAP = &app->wifiList[app->wifiCount]; // BSS slot, no heap
-        newAP->idAP = atoi(f[0]);
+        newAP->idAP = id;
         strncpy(newAP->APssid, f[1], sizeof(newAP->APssid) - 1);
         newAP->APssid[sizeof(newAP->APssid) - 1] = '\0';
         strncpy(newAP->APbssid, f[2], 17);
@@ -6333,14 +6358,11 @@ static void app_free(Petrel* app) {
     // here rather than waited on: pending jobs are dropped, never awaited forever.
     // Let the worker finish what it already accepted (bounded): closing used to free queued
     // captures/reports without writing them or saying so.
-    for(int i = 0; i < 500; i++) {
-        furi_mutex_acquire(storage_mutex, FuriWaitForever);
-        bool empty = (storage_tail == storage_head);
-        furi_mutex_release(storage_mutex);
-        if(empty) break;
-        furi_delay_ms(10);
-    }
+    // 2026-10-29: the timed drain is gone. The worker now exits only after the queue is empty, so
+    // clearing the flag and joining already drains everything that was accepted.
+    furi_mutex_acquire(storage_mutex, FuriWaitForever);
     storage_run = false;
+    furi_mutex_release(storage_mutex);
     if(storage_thread) {
         furi_thread_join(storage_thread);
         furi_thread_free(storage_thread);
