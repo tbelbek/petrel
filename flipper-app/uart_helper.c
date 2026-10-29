@@ -326,9 +326,11 @@ bool uart_helper_read(UartHelper* helper, FuriString* text) {
 void uart_helper_send(UartHelper* helper, const char* data, size_t length) {
     FURI_LOG_D(TAG, __func__);
 
-    FURI_LOG_D(TAG, "%s", data);
+    // 2026-10-29: only log when this is a C string. Binary sends pass an explicit length and the
+    // buffer is not NUL-terminated, so "%s" read past its end.
+    if(length == 0) FURI_LOG_D(TAG, "%s", data);
+    else FURI_LOG_D(TAG, "TX bytes=%lu", (unsigned long)length);
     uart_tx_calls++;
-    uart_tx_bytes += (uint32_t)length;
     if(length == 0) {
         length = strlen(data); // Exclude the null character.
         char* buf = malloc(length + 2); // Null and delimiter.
@@ -336,10 +338,12 @@ void uart_helper_send(UartHelper* helper, const char* data, size_t length) {
         buf[length++] = '\n'; // Add a newline character.
         buf[length] = 0; // Null terminate the string.
         data = buf;
+        uart_tx_bytes += (uint32_t)length;
         furi_hal_serial_tx(helper->serial_handle, (uint8_t*)data, length);
         free(buf);
     } else {
         // Transmit data via UART TX.
+        uart_tx_bytes += (uint32_t)length;
         furi_hal_serial_tx(helper->serial_handle, (uint8_t*)data, length);
     }
 }

@@ -256,6 +256,7 @@ static volatile bool web_portal_mode = false;
 static volatile uint32_t link_last_line = 0;
 static volatile uint32_t link_rx_bytes = 0;    // bytes read from Serial1
 static volatile uint32_t link_lines = 0;       // complete lines parsed from either source
+static volatile uint32_t link_buf_overflows = 0;  // line buffers dropped for exceeding the cap
 static volatile uint32_t link_last_flip_line = 0; // last line that arrived on Serial1 (Flipper)   // millis() of the last PARSED command line (Serial1 or USB)
 static void webui_render(char* b, size_t n);
 
@@ -2586,8 +2587,30 @@ void loop() {
   // reset fixes it. Re-arm Serial1 after a long quiet period; an in-flight line is never torn down
   // because the re-init only runs when nothing has arrived for LINK_QUIET_MS.
   bool got_rx = false;
-  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); link_rx_bytes++; got_rx = true; }
-  while (Serial.available())   { cmdUsb  += (char)Serial.read(); got_rx = true; }
+  // 2026-10-29: the line buffers had no upper bound. Newline-free noise (a floating RX line is
+  // exactly what a disturbed UART produces) grew the String until the heap was gone. Bound it
+  // WHILE ingesting: an oversized line is discarded through its next newline (keeping its tail
+  // could turn a suffix into a valid-looking command), and the loop stops at each newline so the
+  // parser below sees the line before more bytes arrive.
+  {
+    static bool discardFlip = false, discardUsb = false;
+    for(unsigned budget = 64; budget && Serial1.available(); --budget) {
+      int v = Serial1.read(); if(v < 0) break;
+      char c = (char)v; got_rx = true; link_rx_bytes++;
+      if(discardFlip) { if(c == '\n') { discardFlip = false; break; } continue; }
+      if(c == '\n') { cmdFlip += c; break; }
+      if(cmdFlip.length() >= (unsigned)CMD_LINE_MAX) { cmdFlip = ""; discardFlip = true; link_buf_overflows++; continue; }
+      cmdFlip += c;
+    }
+    for(unsigned budget = 64; budget && Serial.available(); --budget) {
+      int v = Serial.read(); if(v < 0) break;
+      char c = (char)v; got_rx = true;
+      if(discardUsb) { if(c == '\n') { discardUsb = false; break; } continue; }
+      if(c == '\n') { cmdUsb += c; break; }
+      if(cmdUsb.length() >= (unsigned)CMD_LINE_MAX) { cmdUsb = ""; discardUsb = true; link_buf_overflows++; continue; }
+      cmdUsb += c;
+    }
+  }
   {
     static uint32_t last_seen_flip = 0;
     static uint32_t last_heal = 0;
