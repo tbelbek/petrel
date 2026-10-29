@@ -747,7 +747,8 @@ typedef enum {
 #define PETREL_EVT_REC_REFRESH 0x2009
 #define PETREL_EVT_BATCH_REFRESH 0x200A
 #define PETREL_EVT_BATCH_RUN 0x200B
-#define PETREL_EVT_POP 0x200C   // pop one scene from the dispatcher, never from a view callback
+#define PETREL_EVT_POP 0x2013   // pop one scene from the dispatcher, never from a view callback
+                                // (0x200C was already taken by PETREL_EVT_INFO_EVIL)
 // Info screen buttons (Edit / Deauth / Evil). They are posted as custom events instead of being
 // handled in the widget button callback: on the installed firmware the GUI is an event loop and
 // handle_input() binds a key to the view that is current when the key is *processed*, so switching
@@ -1177,8 +1178,11 @@ static void petrel_ident(Petrel* app);
 static void petrel_save_scan(const char* kind, const char* body) {
     if(!kind) return;
     if(!set_save) return;   // E4: "Save results" off -> nothing is written
+    static uint16_t scan_seq = 0;
     char name[48];
-    snprintf(name, sizeof(name), "%s.txt", kind);
+    // 2026-10-29: a fixed name + CREATE_ALWAYS meant a second scan in the same session silently
+    // replaced the first, despite the "one timestamped file per scan" contract.
+    snprintf(name, sizeof(name), "%s_%03u.txt", kind, (unsigned)(++scan_seq));
     char path[160];
     petrel_artifact_path(path, sizeof(path), name);   // same helper the other artifacts use
     DateTime dt;
@@ -2636,6 +2640,16 @@ static void wifi_hub_cb(void* context, uint32_t index) {
         // before the outgoing one's are released), so a check inside scan_networks_scene_on_enter
         // always saw the transient floor and refused every scan. At the observed floor during a
         // scan start (free ~4.8 KB, largest block ~1.7 KB) the busy path OOM-crashed the Flipper.
+        // 2026-10-29: replies carry no scan id. Starting scan B while A is unresolved let a late
+        // A "SCAN:OK"/AP line complete and fill B. Refuse the start until the pending one ends.
+        if(app->scan_waiting) {
+            diag(30, 4, 0);   // scan start refused: a scan is already in flight
+            snprintf(popupHeader, sizeof(popupHeader), "%s", "Scan");
+            snprintf(message, sizeof(message), "%s", "Already scanning\n");
+            post_event(app, PETREL_EVT_POPUP);
+            break;
+        }
+        scan_expect_total = 0;   // never inherit the previous list's total
         if(memmgr_get_free_heap() < 8192 || memmgr_heap_get_max_free_block() < 4096) {
             diag(41, (uint32_t)memmgr_get_free_heap(),
                  (uint32_t)memmgr_heap_get_max_free_block()); /* scan refused: low heap */
@@ -5546,7 +5560,11 @@ static void uart_gui_tick(void* context) {
     }
     if(app->scan_waiting &&
        (scanFinish || scanFailed || (int32_t)(furi_get_tick() - app->scan_deadline) >= 0)) {
-        uint32_t reason = scanFailed ? 2u : scanFinish ? 1u : 3u;
+        // 2026-10-29: the tick drains replies BEFORE this check, so a SCAN:OK that arrived after
+        // the deadline still counted as success and sent LISTB for an expired scan. An overdue
+        // reply is a timeout, not a result.
+        bool ended_after_deadline = (int32_t)(furi_get_tick() - app->scan_deadline) >= 0;
+        uint32_t reason = scanFailed ? 2u : (scanFinish && !ended_after_deadline) ? 1u : 3u;
         diag(30, 2, reason); /* completion: OK=1, FAIL=2, deadline=3 */
         app->scan_waiting = false;
 
@@ -5611,37 +5629,27 @@ void uart_process_line(FuriString* line, void* context) {
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
         buffer[sizeof(buffer) - 1] = '\0';
 
-        char* _sv = NULL;
-        char* token = petrel_strtok(buffer, ":|", &_sv); // Omitir "AP:"
-        if(!token) return;
+        // 2026-10-29: split on '|' PRESERVING empty fields. A hidden AP arrives as
+        // "AP:0||BSSID|ch|sec|rssi"; petrel_strtok skips consecutive delimiters, so the SSID slot
+        // swallowed the BSSID and every later field shifted (the record was then dropped).
+        char* f[6]; int nf = 0; char* p = buffer + 3;
+        while(nf < 6) {
+            f[nf++] = p;
+            char* bar = strchr(p, '|');
+            if(!bar) break;
+            *bar = '\0';
+            p = bar + 1;
+        }
+        if(nf < 6) return;
         APDetails* newAP = &app->wifiList[app->wifiCount]; // BSS slot, no heap
-
-        token = petrel_strtok(NULL, "|", &_sv); // ID del AP
-        if(!token) return;
-        newAP->idAP = atoi(token);
-
-        token = petrel_strtok(NULL, "|", &_sv); // SSID
-        if(!token) return;
-        strncpy(newAP->APssid, token, sizeof(newAP->APssid) - 1);
+        newAP->idAP = atoi(f[0]);
+        strncpy(newAP->APssid, f[1], sizeof(newAP->APssid) - 1);
         newAP->APssid[sizeof(newAP->APssid) - 1] = '\0';
-
-        token = petrel_strtok(NULL, "|", &_sv); // BSSID
-        if(!token) return;
-        strncpy(newAP->APbssid, token, 17);
+        strncpy(newAP->APbssid, f[2], 17);
         newAP->APbssid[17] = '\0';
-
-        token = petrel_strtok(NULL, "|", &_sv); // Canal
-        if(!token) return;
-        newAP->chanel = atoi(token);
-
-        token = petrel_strtok(NULL, "|", &_sv); // security
-        if(!token) return;
-        newAP->security = atoi(token);
-
-        token = petrel_strtok(NULL, "|", &_sv); // RSSI
-        if(!token) return;
-        newAP->rssi = atoi(token);
-
+        newAP->chanel = atoi(f[3]);
+        newAP->security = atoi(f[4]);
+        newAP->rssi = atoi(f[5]);
         newAP->deauth = false;
 
         app->wifiCount++;
@@ -5754,7 +5762,10 @@ void uart_process_line(FuriString* line, void* context) {
                 hs_write_pcap(hp, &written, NULL);
             }
             bool complete = hs_quality(qual, sizeof(qual), hist, sizeof(hist));
-            if(audit_mode)
+            // 2026-10-29: audit_write_json() clears audit_mode, so snapshot it first - the message
+            // below used to fall back to /ext/petrel/hs.pcap and drop the "(NOT saved!)" warning.
+            bool was_audit = audit_mode;
+            if(was_audit)
                 audit_write_json("handshake", (int)written, complete, saved, qual, hist);
             snprintf(
                 message,
@@ -5763,8 +5774,8 @@ void uart_process_line(FuriString* line, void* context) {
                 (unsigned)written,
                 qual,
                 hs_channel,
-                audit_mode ? "session dir" : "/ext/petrel/hs.pcap",
-                (audit_mode && !saved) ? " (NOT saved!)" : "");
+                was_audit ? "session dir" : "/ext/petrel/hs.pcap",
+                (was_audit && !saved) ? " (NOT saved!)" : "");
             snprintf(popupHeader, sizeof(popupHeader), "Capture done");
             post_event(app, PETREL_EVT_POPUP);
         }
