@@ -255,7 +255,8 @@ static volatile bool webui_mode = false;
 static volatile bool web_portal_mode = false;
 static volatile uint32_t link_last_line = 0;
 static volatile uint32_t link_rx_bytes = 0;    // bytes read from Serial1
-static volatile uint32_t link_lines = 0;       // complete lines parsed from either source   // millis() of the last PARSED command line (Serial1 or USB)
+static volatile uint32_t link_lines = 0;       // complete lines parsed from either source
+static volatile uint32_t link_last_flip_line = 0; // last line that arrived on Serial1 (Flipper)   // millis() of the last PARSED command line (Serial1 or USB)
 static void webui_render(char* b, size_t n);
 
 // M4: RGB LED gate. While led_quiet (night mode - set by "LED OFF", cleared by "LED ON"/"LED r g b"),
@@ -2588,29 +2589,26 @@ void loop() {
   while (Serial1.available()) { cmdFlip += (char)Serial1.read(); link_rx_bytes++; got_rx = true; }
   while (Serial.available())   { cmdUsb  += (char)Serial.read(); got_rx = true; }
   {
-    static uint32_t last_seen_line = 0;
-    static uint32_t link_last_ok = 0;
-    static bool link_rearmed = false;
+    static uint32_t last_seen_flip = 0;
+    static uint32_t last_heal = 0;
     uint32_t nowm = millis();
-    // 2026-10-29: key off a PARSED line, not raw bytes. A wedged UART can deliver spurious bytes
-    // forever, which used to reset this timer and keep the port dead. A line the parser accepted is
-    // the only proof the link really works. link_rearmed must clear again when a new line arrives,
-    // or the board would heal only once per boot.
-    if(link_last_line != last_seen_line) {
-      last_seen_line = link_last_line;
-      link_last_ok = nowm;
-      link_rearmed = false;
+    // 2026-10-29: judge ONLY the Flipper link and keep retrying. Two defects made the old guard
+    // useless: a USB line (e.g. a bench PING on the CH340) refreshed the same timestamp, and the
+    // one-shot "rearmed" flag only cleared when a NEW line arrived - impossible while RX is dead.
+    // Now: 10 s without a Serial1 line -> re-arm, and try again every 10 s until one arrives.
+    if(link_last_flip_line != last_seen_flip) {
+      last_seen_flip = link_last_flip_line;
+      last_heal = nowm;
     }
-    if(!link_rearmed && (nowm - link_last_ok) > 10000u) {
+    if(last_seen_flip != 0 && (nowm - last_seen_flip) > 10000u && (nowm - last_heal) > 10000u) {
+      last_heal = nowm;
       // Nothing has arrived for 10 s: any bytes still sitting in the buffers are leftovers from
       // before the glitch (a real host line arrives in one go), and leaving them there poisons the
       // next command parse — the first newline would hand the chain "garbage+SCAN" and match
       // nothing. Re-arm the peripheral AND drop the stale bytes.
-      link_rearmed = true;
       Serial1.end();
       Serial1.begin(BAUD);
-      cmdFlip = "";
-      cmdUsb = "";
+      cmdFlip = "";           // only the Flipper buffer: a USB command may be in flight
       Serial.println("LINK:Serial1 re-armed after idle");
     }
   }
@@ -2633,6 +2631,7 @@ void loop() {
       // re-copy the shrinking suffix once per line.
       readString = buf.substring(0, nl + 1);   // one line, trailing '\n' included
       link_last_line = millis();               // a real line arrived (self-heal uses this, not raw bytes)
+      if(src == 1) link_last_flip_line = link_last_line;   // USB traffic must NOT certify the Flipper link
       link_lines++;
       buf.remove(0, nl + 1);
     {

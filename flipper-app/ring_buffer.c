@@ -76,8 +76,10 @@ size_t ring_buffer_available(RingBuffer* rb) {
             // Write can go up to read - 1
             available = rb->ring_buffer_read - rb->ring_buffer_write;
         } else {
-            // Write can go up to end of buffer, then from start to read - 1
-            available = (ring_buffer_size - rb->ring_buffer_write) + rb->ring_buffer_read;
+            // Write can go up to end of buffer, then from start to read - 1. One slot is always
+            // kept free to tell full from empty, so subtract it here (2026-10-29: was one too many,
+            // which let a wrap overwrite the oldest byte).
+            available = (ring_buffer_size - rb->ring_buffer_write) + rb->ring_buffer_read - 1;
         }
 
         furi_mutex_release(rb->mutex);
