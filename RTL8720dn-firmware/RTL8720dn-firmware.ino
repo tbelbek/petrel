@@ -2597,13 +2597,11 @@ void loop() {
       // next command parse — the first newline would hand the chain "garbage+SCAN" and match
       // nothing. Re-arm the peripheral AND drop the stale bytes.
       link_rearmed = true;
-      // TEST 2026-10-28: the halt always lands 4-5 s after this re-arm, so the re-init itself is
-      // the suspect. Log it, do not tear the peripheral down.
-      // Serial1.end();
-      // Serial1.begin(BAUD);
+      Serial1.end();
+      Serial1.begin(BAUD);
       cmdFlip = "";
       cmdUsb = "";
-      Serial.println("LINK:rearm-skipped (self-heal disabled for test)");
+      Serial.println("LINK:Serial1 re-armed after idle");
     }
   }
   // Process EVERY complete line, in order, from both sources (USB first: the out-of-band control
