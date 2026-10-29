@@ -5434,6 +5434,11 @@ static void petrel_scan_frame(uint8_t type, const uint8_t* p, uint16_t len, void
 
 // Dispatcher thread: drain what the worker queued, and finish the scan wait. One line per call so
 // that custom events posted by the line handlers are serviced in between.
+extern volatile uint32_t uart_rx_bytes;
+extern volatile uint32_t uart_rx_dropped;
+extern volatile uint32_t uart_rx_errors;
+extern volatile uint32_t uart_tx_calls;
+
 static void uart_gui_tick(void* context) {
     Petrel* app = context;
     // M4: night LED auto-off. The Flipper has an RTC; the board does not. Once a minute, if we are
@@ -5496,6 +5501,10 @@ static void uart_gui_tick(void* context) {
             // a scan is in flight, so equivalent phases can be compared across laps for a leak.
             diag(1, (uint32_t)scene_manager_get_current_scene(app->scene_manager),
                  app->scan_waiting ? 1u : 0u);
+            // 2026-10-29 link counters: RX bytes/drops, RX errors, TX calls. A dying link shows up
+            // here before it looks like "the board stopped answering".
+            diag(60, uart_rx_bytes, uart_rx_dropped);
+            diag(61, uart_rx_errors, uart_tx_calls);
         }
     }
     // Re-identify an unidentified board. The app learns the capability string once, from the reply

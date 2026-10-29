@@ -253,7 +253,9 @@ static volatile bool webui_mode = false;
 // Evil-twin / Create AP captive portal served via the raw-lwIP listener (web_lwip). Set while the
 // AP is up; AT_HTTP picks the portal listener over the WebUI one.
 static volatile bool web_portal_mode = false;
-static volatile uint32_t link_last_line = 0;   // millis() of the last PARSED command line (Serial1 or USB)
+static volatile uint32_t link_last_line = 0;
+static volatile uint32_t link_rx_bytes = 0;    // bytes read from Serial1
+static volatile uint32_t link_lines = 0;       // complete lines parsed from either source   // millis() of the last PARSED command line (Serial1 or USB)
 static void webui_render(char* b, size_t n);
 
 // M4: RGB LED gate. While led_quiet (night mode - set by "LED OFF", cleared by "LED ON"/"LED r g b"),
@@ -2542,11 +2544,11 @@ void loop() {
       char db[112];
       web_lwip_diag_tick();
       { extern volatile unsigned g_dns_stage, g_dhcp_stage, g_dns_sz;
-      snprintf(db, sizeof(db), "DIAG h=%u s=%u n=%u t=%u p=%u b=%u d=%u hc=%u z=%u q=%u",
+      snprintf(db, sizeof(db), "DIAG h=%u s=%u n=%u t=%u p=%u b=%u d=%u hc=%u z=%u q=%u lx=%u ln=%u",
                (unsigned)xPortGetFreeHeapSize(), web_lwip_stage(), web_lwip_reqs(), web_lwip_ticks(),
                (unsigned)g_sp_min, (unsigned)g_sp_base,
                (unsigned)g_dns_stage, (unsigned)g_dhcp_stage, (unsigned)g_dns_sz,
-               web_lwip_pcb_state()); }
+               web_lwip_pcb_state(), (unsigned)link_rx_bytes, (unsigned)link_lines); }
       Serial.println(db);
     }
   }
@@ -2583,7 +2585,7 @@ void loop() {
   // reset fixes it. Re-arm Serial1 after a long quiet period; an in-flight line is never torn down
   // because the re-init only runs when nothing has arrived for LINK_QUIET_MS.
   bool got_rx = false;
-  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); got_rx = true; }
+  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); link_rx_bytes++; got_rx = true; }
   while (Serial.available())   { cmdUsb  += (char)Serial.read(); got_rx = true; }
   {
     static uint32_t last_seen_line = 0;
@@ -2631,6 +2633,7 @@ void loop() {
       // re-copy the shrinking suffix once per line.
       readString = buf.substring(0, nl + 1);   // one line, trailing '\n' included
       link_last_line = millis();               // a real line arrived (self-heal uses this, not raw bytes)
+      link_lines++;
       buf.remove(0, nl + 1);
     {
         // D.4/2 command gate (architect): the lifecycle owns the radio while it runs.

@@ -12,6 +12,14 @@
 #include "ring_buffer.h"
 #include "petrel_proto.h" // framed-binary (0xA5) side-channel decoder
 #define TAG "Petrel"
+
+// 2026-10-29 link counters: read from the app's diag record so a dying link is visible instead of
+// looking like "the board stopped answering".
+volatile uint32_t uart_rx_bytes = 0;
+volatile uint32_t uart_rx_dropped = 0;
+volatile uint32_t uart_rx_errors = 0;
+volatile uint32_t uart_tx_calls = 0;
+volatile uint32_t uart_tx_bytes = 0;
 /**
  * Callback invoked when a line is read from the UART.
 */
@@ -77,10 +85,19 @@ static void uart_helper_received_byte_callback(
     void* context) {
     UartHelper* helper = context;
 
-    if(event == FuriHalSerialRxEventData) {
+    // 2026-10-29: `event` is a BITMASK (data | idle | overrun | framing | parity | noise). The old
+    // equality test skipped the read whenever any other flag was set together with data, and the
+    // HAL explicitly warns that leaving RX data unread can make the interrupt fire forever and hang
+    // the system - which matches the freeze we saw. Always test the bit.
+    if(event & FuriHalSerialRxEventData) {
         uint8_t data = furi_hal_serial_async_rx(handle);
-        furi_stream_buffer_send(helper->rx_stream, (void*)&data, 1, 0);
+        uart_rx_bytes++;
+        if(furi_stream_buffer_send(helper->rx_stream, (void*)&data, 1, 0) != 1) uart_rx_dropped++;
         furi_thread_flags_set(furi_thread_get_id(helper->worker_thread), WorkerEventDataWaiting);
+    }
+    if(event & (FuriHalSerialRxEventOverrunError | FuriHalSerialRxEventFrameError |
+                FuriHalSerialRxEventParityError | FuriHalSerialRxEventNoiseError)) {
+        uart_rx_errors++;   // surfaced in the diag line; a healthy link keeps this at 0
     }
 }
 
@@ -310,6 +327,8 @@ void uart_helper_send(UartHelper* helper, const char* data, size_t length) {
     FURI_LOG_D(TAG, __func__);
 
     FURI_LOG_D(TAG, "%s", data);
+    uart_tx_calls++;
+    uart_tx_bytes += (uint32_t)length;
     if(length == 0) {
         length = strlen(data); // Exclude the null character.
         char* buf = malloc(length + 2); // Null and delimiter.
