@@ -323,8 +323,10 @@ static err_t web_send_body(struct tcp_pcb* tpcb, struct web_send* ws) {
         ws->off += chunk;
     }
     tcp_output(tpcb);
-    // all bytes queued: wait for the ACKs, web_sent() aborts once they are all in
-    if (ws->acked >= ws->len) return web_abort_done(tpcb, (struct web_conn*)ws->conn);
+    // all bytes queued: graceful close (lwIP flushes queued data before the FIN). Aborting after
+    // the ACKs was only a diagnostic step - it sends RST after a complete response, which some
+    // clients surface as a failed page load.
+    web_finish(tpcb, (struct web_conn*)ws->conn);
     return ERR_OK;
 }
 
@@ -351,7 +353,6 @@ static err_t web_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     if (c && c->ws) {
         c->ws->acked += (int)len;
         if (c->ws->off < c->ws->len) return web_send_body(tpcb, c->ws);
-        if (c->ws->acked >= c->ws->len) return web_abort_done(tpcb, c);
     }
     return ERR_OK;
 }
