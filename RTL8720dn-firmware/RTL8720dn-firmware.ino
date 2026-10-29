@@ -3085,6 +3085,14 @@ void loop() {
         DEBUG_SER_PRINT("Wrong AP");
       }
 
+    }else if(readString.substring(0,6)=="REBOOT"){
+      // 2026-10-29: soft reset on demand. The board's reset line is not wired to the Flipper, so a
+      // wedged board could only be recovered with a USB cable; the app sends this instead.
+      Serial.println("REBOOT:ack");
+      Serial1.println("REBOOT:ack");
+      Serial.flush();
+      delay(50);
+      NVIC_SystemReset();
     }else if(readString.substring(0,4)=="PING"){
       
       Serial.print("PONG\n");

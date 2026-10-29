@@ -747,6 +747,7 @@ typedef enum {
 #define PETREL_EVT_REC_REFRESH 0x2009
 #define PETREL_EVT_BATCH_REFRESH 0x200A
 #define PETREL_EVT_BATCH_RUN 0x200B
+#define PETREL_EVT_POP 0x200C   // pop one scene from the dispatcher, never from a view callback
 // Info screen buttons (Edit / Deauth / Evil). They are posted as custom events instead of being
 // handled in the widget button callback: on the installed firmware the GUI is an event loop and
 // handle_input() binds a key to the view that is current when the key is *processed*, so switching
@@ -2626,6 +2627,12 @@ static void petrel_badble_run(Petrel* app) {
     petrel_busy(app, "BadBLE", "BadBLE 30s...");
 }
 
+// 2026-10-29: set while waiting for the board to come back after the app sent REBOOT. The reply
+// (IDENT) proves the reset actually happened; a timeout turns into an explicit "no reply" popup
+// instead of leaving the operator guessing.
+static bool reset_waiting = false;
+static uint32_t reset_deadline = 0;
+
 static void wifi_hub_cb(void* context, uint32_t index) {
     Petrel* app = context;
     switch(index) {
@@ -2662,6 +2669,21 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 11: karma_trap = false; scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 12: karma_trap = true;  scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 13: scene_manager_next_scene(app->scene_manager, scriptListScene); break;
+    case 17:
+        uart_helper_send(app->uart_helper, "REBOOT\n", 7);
+        // Force a fresh identification: the board answers HELLO only after it has rebooted, so the
+        // IDENT is the proof that the reset really happened. Leave the hub so the operator sees
+        // that the session ended instead of sitting on a menu that no longer controls anything.
+        app->fw_caps[0] = '\0';
+        app->ident_attempts = 0;
+        app->ident_last_tick = 0;
+        reset_waiting = true;
+        reset_deadline = furi_get_tick() + furi_ms_to_ticks(20000);
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Board reset");
+        snprintf(message, sizeof(message), "%s", "Waiting for it to answer\n");
+        post_event(app, PETREL_EVT_POP);        // leave the hub (dispatcher context)
+        post_event(app, PETREL_EVT_POPUP);      // then show the "waiting" popup
+        break;
     case 14: scene_manager_next_scene(app->scene_manager, recordScene); break;
     case 15: scene_manager_next_scene(app->scene_manager, toolsMenuScene); break;
     case 16: scene_manager_next_scene(app->scene_manager, batchScene); break;
@@ -2748,6 +2770,10 @@ void wifi_hub_scene_on_enter(void* context) {
     }
     submenu_add_item(app->submenu, "Run script", 13, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Macro (record)", 14, wifi_hub_cb, app);
+    // 2026-10-29: the board is powered from the Flipper but its reset line is not wired, so a
+    // wedged board used to need a USB cable. A soft reset command gives the operator a way out
+    // from the device alone.
+    submenu_add_item(app->submenu, "Reset board", 17, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -3070,8 +3096,23 @@ static uint32_t st_due = 0;
 static volatile bool st_active = false;
 
 static void selftest_step(Petrel* app) {
-    // Let the production scan completion path return before taking another action.
-    if(app->scan_waiting) return;
+    // Let the production scan completion path return before taking another action. If it never
+    // does (board silent, link dead), abort the self-test instead of freezing the app: the old
+    // unconditional return left the UI unresponsive with no way back.
+    if(app->scan_waiting) {
+        static uint32_t wait_since = 0;
+        uint32_t nowt = furi_get_tick();
+        if(!wait_since) wait_since = nowt;
+        if((int32_t)(nowt - wait_since) > (int32_t)furi_ms_to_ticks(20000)) {
+            wait_since = 0;
+            app->scan_waiting = false;
+            st_active = false;
+            diag(19, 99u, 1u);   // self-test failure: scan completion never arrived
+            view_dispatcher_stop(app->view_dispatcher);
+        }
+        return;
+    }
+    (void)0;
 
     // Finish on a later tick, after any scan started by the final step has completed.
     if(st_lap >= ST_LAPS) {
@@ -3101,7 +3142,11 @@ static void selftest_step(Petrel* app) {
         break;
     case wifiHubScene:
         // Production submenu callback IDs, not the custom-event enum.
-        wifi_hub_cb(app, (st_lap & 1) == 0 ? 0u : 2u);
+        // 2026-10-29: do NOT start a scan here. Driving the scan scene from this tick wedged the
+        // GUI thread (scan_waiting then blocked the very step that would have popped the scene,
+        // and the app stopped answering keys). The scan is covered by the manual flow; the
+        // self-test now walks List Wifi / Channel Map instead.
+        wifi_hub_cb(app, (st_lap & 1) == 0 ? 1u : 2u);
         break;
     default:
         // root_below was checked BEFORE attempting the pop.
@@ -5293,6 +5338,12 @@ static bool Petrel_custom_callback(void* context, uint32_t custom_event) {
         petrel_show_result(app, pmfScene);
         return true;
     }
+    if(custom_event == PETREL_EVT_POP) {
+        // 2026-10-29: popping the hub from inside the submenu callback wedged the input loop.
+        // Do it here, in the dispatcher's own event context.
+        (void)scene_manager_previous_scene(app->scene_manager);
+        return true;
+    }
     if(custom_event == PETREL_EVT_POPUP) {
         if(script_running) return true;   // F1: ditto for the per-command popups
         if(busy_active) {
@@ -5468,6 +5519,12 @@ static void uart_gui_tick(void* context) {
     // item 0.6, every capability-gated row disappeared with no way back. Ask again until it
     // answers, a few seconds apart, and stop as soon as we have an identity.
     if(app->fw_caps[0] == '\0' && app->ident_attempts < 3) petrel_ident(app);
+    if(reset_waiting && (int32_t)(furi_get_tick() - reset_deadline) >= 0) {
+        reset_waiting = false;
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Board reset");
+        snprintf(message, sizeof(message), "%s", "No reply after reset\n");
+        post_event(app, PETREL_EVT_POPUP);
+    }
     // A failed save is worth interrupting for - the alternative was silence, so the user believed
     // the artifact was on the card. Consumed ONCE per failure via the sequence number, never once
     // per tick: each popup pushes a scene, and the scene history has no depth limit.
@@ -5957,6 +6014,12 @@ void uart_process_line(FuriString* line, void* context) {
             petrel_strcat(wpa_lines, s);
             petrel_strcat(wpa_lines, "\n");
         }
+    } else if(strncmp(furi_string_get_cstr(line), "REBOOT:ack", 10) == 0) {
+        // The board received the command and is about to reset. Proves the command path even if
+        // the IDENT that follows is missed.
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Board reset");
+        snprintf(message, sizeof(message), "%s", "Acknowledged, rebooting\n");
+        post_event(app, PETREL_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "IDENT:", 6) == 0) {
         // A: board capability/version advertisement (HELLO response).
         const char* s = furi_string_get_cstr(line);
@@ -5979,6 +6042,12 @@ void uart_process_line(FuriString* line, void* context) {
             post_event(app, PETREL_EVT_REIDENTIFIED);   // let the current menu rebuild
         }
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
+        if(reset_waiting) {   // proof the board really rebooted
+            reset_waiting = false;
+            snprintf(popupHeader, sizeof(popupHeader), "%s", "Board reset");
+            snprintf(message, sizeof(message), "%s", "Back online\n");
+            post_event(app, PETREL_EVT_POPUP);
+        }
     } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
         petrel_save_scan("ble", recon_text);
