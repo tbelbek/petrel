@@ -253,6 +253,7 @@ static volatile bool webui_mode = false;
 // Evil-twin / Create AP captive portal served via the raw-lwIP listener (web_lwip). Set while the
 // AP is up; AT_HTTP picks the portal listener over the WebUI one.
 static volatile bool web_portal_mode = false;
+static volatile uint32_t link_last_line = 0;   // millis() of the last PARSED command line (Serial1 or USB)
 static void webui_render(char* b, size_t n);
 
 // M4: RGB LED gate. While led_quiet (night mode - set by "LED OFF", cleared by "LED ON"/"LED r g b"),
@@ -2585,13 +2586,20 @@ void loop() {
   while (Serial1.available()) { cmdFlip += (char)Serial1.read(); got_rx = true; }
   while (Serial.available())   { cmdUsb  += (char)Serial.read(); got_rx = true; }
   {
-    static uint32_t link_last_rx = 0;
+    static uint32_t last_seen_line = 0;
+    static uint32_t link_last_ok = 0;
     static bool link_rearmed = false;
     uint32_t nowm = millis();
-    if(got_rx) {
-      link_last_rx = nowm;
+    // 2026-10-29: key off a PARSED line, not raw bytes. A wedged UART can deliver spurious bytes
+    // forever, which used to reset this timer and keep the port dead. A line the parser accepted is
+    // the only proof the link really works. link_rearmed must clear again when a new line arrives,
+    // or the board would heal only once per boot.
+    if(link_last_line != last_seen_line) {
+      last_seen_line = link_last_line;
+      link_last_ok = nowm;
       link_rearmed = false;
-    } else if(!link_rearmed && (nowm - link_last_rx) > 10000u) {
+    }
+    if(!link_rearmed && (nowm - link_last_ok) > 10000u) {
       // Nothing has arrived for 10 s: any bytes still sitting in the buffers are leftovers from
       // before the glitch (a real host line arrives in one go), and leaving them there poisons the
       // next command parse — the first newline would hand the chain "garbage+SCAN" and match
@@ -2622,6 +2630,7 @@ void loop() {
       // an unchecked allocation that could silently lose the rest of the buffer) and it does not
       // re-copy the shrinking suffix once per line.
       readString = buf.substring(0, nl + 1);   // one line, trailing '\n' included
+      link_last_line = millis();               // a real line arrived (self-heal uses this, not raw bytes)
       buf.remove(0, nl + 1);
     {
         // D.4/2 command gate (architect): the lifecycle owns the radio while it runs.
