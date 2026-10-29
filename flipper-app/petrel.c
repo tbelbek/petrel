@@ -2756,7 +2756,12 @@ bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void wifi_hub_scene_on_exit(void* context) {
-    UNUSED(context);
+    // 2026-10-29: leaving the Wi-Fi hub ends the session, so release the radio. Without this the
+    // board stayed in APTEST after the portal was closed and every later AP start failed with
+    // "APTEST owns radio" until the board was reset. Sending STOP when nothing is running is a
+    // no-op, so this also covers the "just browsed the hub" case.
+    Petrel* app = context;
+    uart_helper_send(app->uart_helper, "STOP\n", 5);
 }
 
 static void ble_hub_cb(void* context, uint32_t index) {
