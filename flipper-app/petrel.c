@@ -2751,17 +2751,17 @@ void wifi_hub_scene_on_enter(void* context) {
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
-    UNUSED(context);
-    UNUSED(event);
+    // 2026-10-29: send STOP only when the hub is POPPED (BACK to the main menu), not when a child
+    // scene opens. on_exit also runs on next_scene, so putting STOP there killed the scan the
+    // moment its busy scene opened ("Scanning networks..." then straight back to the hub).
+    Petrel* app = context;
+    if(event.type == SceneManagerEventTypeBack) {
+        uart_helper_send(app->uart_helper, "STOP\n", 5);
+    }
     return false;
 }
 void wifi_hub_scene_on_exit(void* context) {
-    // 2026-10-29: leaving the Wi-Fi hub ends the session, so release the radio. Without this the
-    // board stayed in APTEST after the portal was closed and every later AP start failed with
-    // "APTEST owns radio" until the board was reset. Sending STOP when nothing is running is a
-    // no-op, so this also covers the "just browsed the hub" case.
-    Petrel* app = context;
-    uart_helper_send(app->uart_helper, "STOP\n", 5);
+    UNUSED(context);
 }
 
 static void ble_hub_cb(void* context, uint32_t index) {
