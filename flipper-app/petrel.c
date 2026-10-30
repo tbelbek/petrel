@@ -846,9 +846,33 @@ bool parse_mac(const char* mac_str, uint8_t* out_bytes) {
 // ready for `hcxpcapngtool -o x.hc22000` -> `hashcat -m 22000`. ---
 #define HS_FRAME_MAX  256
 #define HS_MAX_FRAMES 16
-static uint8_t hs_frames[HS_MAX_FRAMES][HS_FRAME_MAX];
-static uint16_t hs_lens[HS_MAX_FRAMES];
+// On-demand (2026-10-30): these were static .bss (4 KB + 32 B), resident for the whole app even
+// though a handshake capture is a rare, discrete action. Now allocated lazily on the first capture
+// (hs_ensure, called from the HSCAP handler) and freed in app_free. That removes 4 KB from the
+// FAP's load-time allocation -- the fragmented-heap PRELOAD failure chokes on exactly that -- and
+// gives 4 KB more idle headroom until the first capture. Everything that touches these runs on the
+// one GUI/dispatcher thread (uart_process_line + scene handlers; see the note at line ~277), so no
+// lock is needed. The producer (HSFRAME) NULL-guards, so a frame arriving without a buffer (alloc
+// failed, or a late frame after teardown) is dropped instead of crashing.
+static uint8_t (*hs_frames)[HS_FRAME_MAX] = NULL; // [HS_MAX_FRAMES][HS_FRAME_MAX] when allocated
+static uint16_t* hs_lens = NULL; // [HS_MAX_FRAMES] when allocated
 static uint16_t hs_count = 0;
+
+// Allocate the handshake buffers if they are not up yet. Returns false on low memory, leaving both
+// NULL so the capture simply reports no frames (the i < hs_count loops below then do nothing).
+static bool hs_ensure(void) {
+    if(hs_frames && hs_lens) return true;
+    hs_frames = malloc(sizeof(hs_frames[0]) * HS_MAX_FRAMES);
+    hs_lens = malloc(sizeof(hs_lens[0]) * HS_MAX_FRAMES);
+    if(!hs_frames || !hs_lens) {
+        free(hs_frames);
+        free(hs_lens);
+        hs_frames = NULL;
+        hs_lens = NULL;
+        return false;
+    }
+    return true;
+}
 static int hs_channel = 0;
 static char popupHeader[20] = "ERROR";
 
@@ -5723,11 +5747,12 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "HSCAP:", 6) == 0) {
         // Board header before a HSFRAME dump: "HSCAP: ch=N count=N".
         hs_count = 0;
+        hs_ensure(); // lazily (re)allocate the frame buffer; if it fails, HSFRAME below drops frames
         const char* s = strstr(furi_string_get_cstr(line), "ch=");
         hs_channel = s ? atoi(s + 3) : 0;
     } else if(strncmp(furi_string_get_cstr(line), "HSFRAME:", 8) == 0) {
         const char* hex = furi_string_get_cstr(line) + 8;
-        if(hs_count < HS_MAX_FRAMES) {
+        if(hs_frames && hs_count < HS_MAX_FRAMES) {
             uint16_t n = 0;
             const char* p = hex;
             bool clean = true;
@@ -6352,6 +6377,12 @@ static void app_free(Petrel* app) {
         furi_string_free(leftover);
     }
     furi_message_queue_free(app->uart_lines);
+    // On-demand handshake buffer (hs_ensure): every producer is gone by here -- the UART worker was
+    // joined in uart_helper_free() above and the dispatcher tick no longer fires -- so this is safe.
+    free(hs_frames);
+    free(hs_lens);
+    hs_frames = NULL;
+    hs_lens = NULL;
     // Last, now that every producer is gone (all timers stopped above, the UART worker joined in
     // uart_helper_free, and the dispatcher's tick can no longer fire because its loop returned).
     // Stop the storage worker BEFORE anything else is torn down. Its queue is drained and freed
