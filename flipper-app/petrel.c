@@ -5227,7 +5227,12 @@ void config_ap_scene_on_enter(void* context) {
     item = variable_item_list_add(app->variableList, "Start", 1, NULL, NULL);
     variable_item_list_set_enter_callback(app->variableList, config_ap_change_call_back, app);
 
-        // put the cursor back where it was (clamped to the rebuilt list)
+        // put the cursor back where it was, clamped to the rebuilt list. The list is shared across
+    // scenes, so keep_row (and the model->position reset() leaves untouched) can be a stale index
+    // from a LONGER menu; a value past this list's end makes variable_item_list_get_selected_item
+    // walk to the M*LIB end iterator and ref() it -> furi_check failed on the next OK. idx == row
+    // count here. set_selected_item clamps on mainline fw but NOT on the ufbt fork we build against.
+    if(keep_row >= idx) keep_row = idx ? (uint8_t)(idx - 1) : 0;
     variable_item_list_set_selected_item(app->variableList, keep_row);
 view_dispatcher_switch_to_view(app->view_dispatcher, configAPView);
 }
