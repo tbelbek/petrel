@@ -289,8 +289,7 @@ int scanNetworks(int miliseconds) {
     }
     scan_running = false;
   }
-  scan_results.clear();
-  if (scan_results.capacity() < 64) scan_results.reserve(64);   // avoid realloc per push_back
+  scan_results.clear();   // keeps capacity (reserved to the 255 cap in setup), so no realloc here
   SCANDONE_SET(false);
   scan_running = true;
   DEBUG_SER_PRINT("wifi get band type:"+(String)wifi_get_band_type()+"\n");
@@ -347,6 +346,14 @@ void setup() {
   readString.reserve(50);
   cmdUsb.reserve(50);
   cmdFlip.reserve(50);
+  // Reserve the FULL scan cap (255, see scanResultHandler) ONCE, up front. The backing array then
+  // never reallocates: scan_results.clear() keeps capacity, and push_back (<=255) stays in place.
+  // This fixes a hard-fault reboot -- a dense 2.4+5 GHz scan exceeds the old reserve(64), and a
+  // push_back from the WiFi driver task reallocating the vector while LIST iterates it (possible
+  // once SCANDONE flips during a timed-out/overlapping scan) was a use-after-free. A mutex is the
+  // wrong fix: LIST's iteration is a long blocking dual-UART print, and stalling the WiFi task on a
+  // lock across it makes the driver reset the board instead.
+  scan_results.reserve(256);
   DEBUG_SER_PRINT("Iniciando\n");
   
   WiFi.enableConcurrent();
