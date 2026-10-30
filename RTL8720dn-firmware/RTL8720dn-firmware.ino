@@ -112,6 +112,7 @@ static bool scan_done = false;
 // True while the driver may still be calling scanResultHandler. A timeout does NOT cancel the scan,
 // so the next scan must wait for the old one before clearing the vector under it.
 static bool scan_running = false;
+static uint32_t scan_started_ms = 0;   // set when a scan starts; loop() clears a clearly-stale scan
 std::vector<int> deauth_wifis, wifis_temp;
 //WiFiServer server(80);
 uint8_t deauth_bssid[6];
@@ -292,6 +293,7 @@ int scanNetworks(int miliseconds) {
   scan_results.clear();   // keeps capacity (reserved to the 255 cap in setup), so no realloc here
   SCANDONE_SET(false);
   scan_running = true;
+  scan_started_ms = millis();
   DEBUG_SER_PRINT("wifi get band type:"+(String)wifi_get_band_type()+"\n");
   DEBUG_SER_PRINT("scan results cleared...");
   
@@ -2541,6 +2543,42 @@ void destroyAP()
     if (atOwned()) atStop();
 }
 
+// Drain both UARTs' RX FIFOs into the line buffers WITHOUT parsing. Called from loop() every pass
+// and, during long blocking command handlers, from link_delay() -- so the board's Serial1 RX FIFO
+// never overruns while a handler runs. Root cause of "Serial1 link dies after minutes": handlers
+// below block for up to 60 s in `for(i<secs)delay(1000)` and never let loop() read Serial1, so the
+// FIFO overflowed and the parse desynced. Single-threaded: loop() is not running while a handler
+// runs, so this is never truly reentrant. A completed Flipper line refreshes link_last_flip_line so
+// the idle self-heal below does not fire spuriously right after a long op (otherwise only the parser
+// refreshed it, and a >10 s handler looked like a dead link).
+static void link_pump(void) {
+  static bool discardFlip = false, discardUsb = false;
+  for(unsigned budget = 128; budget && Serial1.available(); --budget) {
+    int v = Serial1.read(); if(v < 0) break;
+    char c = (char)v; link_rx_bytes++;
+    if(discardFlip) { if(c == '\n') { discardFlip = false; break; } continue; }
+    if(c == '\n') { cmdFlip += c; link_last_flip_line = millis(); break; }
+    if(cmdFlip.length() >= (unsigned)CMD_LINE_MAX) { cmdFlip = ""; discardFlip = true; link_buf_overflows++; continue; }
+    cmdFlip += c;
+  }
+  for(unsigned budget = 128; budget && Serial.available(); --budget) {
+    int v = Serial.read(); if(v < 0) break;
+    char c = (char)v;
+    if(discardUsb) { if(c == '\n') { discardUsb = false; break; } continue; }
+    if(c == '\n') { cmdUsb += c; break; }
+    if(cmdUsb.length() >= (unsigned)CMD_LINE_MAX) { cmdUsb = ""; discardUsb = true; link_buf_overflows++; continue; }
+    cmdUsb += c;
+  }
+}
+
+// Blocking wait that keeps Serial1 drained. Drop-in for a bare delay()/`for(i<secs)delay(1000)` in
+// command handlers so the control link survives multi-second operations. 5 ms slices x 128 B is
+// ~25 kB/s, well over the 11.5 kB/s line rate, so the FIFO cannot back up.
+static void link_delay(uint32_t ms) {
+  uint32_t t0 = millis();
+  do { link_pump(); delay(5); } while((uint32_t)(millis() - t0) < ms);
+}
+
 void loop() {
   // DIAG (2026-10-28): the board hard-locks while serving a portal page. Codex's leading theory is
   // tcpip-task stack exhaustion hitting this core's fatal overflow hook (which spins forever). The
@@ -2593,31 +2631,15 @@ void loop() {
   // re-armed — the host then sees a board that never answers IDENT or SCAN:OK, and only a board
   // reset fixes it. Re-arm Serial1 after a long quiet period; an in-flight line is never torn down
   // because the re-init only runs when nothing has arrived for LINK_QUIET_MS.
-  bool got_rx = false;
-  // 2026-10-29: the line buffers had no upper bound. Newline-free noise (a floating RX line is
-  // exactly what a disturbed UART produces) grew the String until the heap was gone. Bound it
-  // WHILE ingesting: an oversized line is discarded through its next newline (keeping its tail
-  // could turn a suffix into a valid-looking command), and the loop stops at each newline so the
-  // parser below sees the line before more bytes arrive.
-  {
-    static bool discardFlip = false, discardUsb = false;
-    for(unsigned budget = 64; budget && Serial1.available(); --budget) {
-      int v = Serial1.read(); if(v < 0) break;
-      char c = (char)v; got_rx = true; link_rx_bytes++;
-      if(discardFlip) { if(c == '\n') { discardFlip = false; break; } continue; }
-      if(c == '\n') { cmdFlip += c; break; }
-      if(cmdFlip.length() >= (unsigned)CMD_LINE_MAX) { cmdFlip = ""; discardFlip = true; link_buf_overflows++; continue; }
-      cmdFlip += c;
-    }
-    for(unsigned budget = 64; budget && Serial.available(); --budget) {
-      int v = Serial.read(); if(v < 0) break;
-      char c = (char)v; got_rx = true;
-      if(discardUsb) { if(c == '\n') { discardUsb = false; break; } continue; }
-      if(c == '\n') { cmdUsb += c; break; }
-      if(cmdUsb.length() >= (unsigned)CMD_LINE_MAX) { cmdUsb = ""; discardUsb = true; link_buf_overflows++; continue; }
-      cmdUsb += c;
-    }
-  }
+  // Drain both UART FIFOs into cmdFlip/cmdUsb (bounded, no parse). Same work runs inside
+  // link_delay() during long handlers so Serial1 never backs up. See link_pump() above.
+  link_pump();
+
+  // Minor (advisor): if the WiFi driver never fires scan_done, scan_running would stay true forever
+  // and every later SCAN/LIST would refuse with "scan still running". Clear a clearly-stale scan
+  // (30 s >> the ~10 s a real scan takes). Safe now that scan_results is reserved to its cap: a late
+  // push_back from the driver can no longer realloc, so dropping the flag can't corrupt a reader.
+  if(scan_running && (uint32_t)(millis() - scan_started_ms) > 30000u) scan_running = false;
   {
     static uint32_t last_seen_flip = 0;
     static uint32_t last_heal = 0;
@@ -3243,7 +3265,7 @@ void loop() {
       pm_total=0; pm_mgmt=0; pm_ctrl=0; pm_data=0; pm_eapol=0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       String r = "PROMISC: ch="+String(ch)+" total="+String((unsigned)pm_total)+
                  " mgmt="+String((unsigned)pm_mgmt)+" ctrl="+String((unsigned)pm_ctrl)+
@@ -3526,7 +3548,7 @@ void loop() {
         ad->setAdvData(b, n);
         ad->startAdv();
         Serial.println("BLEIBEACON:on"); Serial1.println("BLEIBEACON:on");
-        for(int i=0;i<secs;i++) delay(1000);
+        link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
         ad->stopAdv();
         BLE.end();
         Serial.println("BLEIBEACON:off"); Serial1.println("BLEIBEACON:off");
@@ -3550,7 +3572,7 @@ void loop() {
         ad->setAdvData(buf, n);
         ad->startAdv();
         Serial.println("BLEADV:on"); Serial1.println("BLEADV:on");
-        for(int i=0;i<secs;i++) delay(1000);
+        link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
         ad->stopAdv();
         BLE.end();
         Serial.println("BLEADV:off"); Serial1.println("BLEADV:off");
@@ -3751,7 +3773,7 @@ void loop() {
       ids_n = 0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_ids_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0, NULL, 0);
       ids_stream(ch);
     }else if(readString.substring(0,10)=="PROBESNIFF"){
@@ -3766,7 +3788,7 @@ void loop() {
       probe_n = 0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_probe_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       probe_stream(ch);
     }else if(readString.substring(0,8)=="RECFETCH"){
@@ -4416,7 +4438,7 @@ void loop() {
       PMFN_SET(0);
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_pmf_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       pmf_stream(ch);
     }else if(readString.substring(0,5)=="TRACK"){
@@ -4434,7 +4456,7 @@ void loop() {
       cli_base = millis();
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_cli_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       cli_on = false;
       cli_stream(ch);
@@ -4464,7 +4486,7 @@ void loop() {
         sta_filter[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_sta_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0, NULL, 0);
       sta_stream(ch);
     }else if(readString.substring(0,11)=="PMKIDCLIENT"){
@@ -4521,7 +4543,7 @@ void loop() {
       hsg_target_set = false;   // passive PMKID scan is channel-wide: keep every AP's PMKID
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3, promisc_pmkid_cb, 0);
-      for(int i=0;i<secs;i++) delay(1000);
+      link_delay((uint32_t)secs * 1000u);   // keeps Serial1 drained during the op (was for(i<secs)delay(1000))
       wifi_set_promisc(0, NULL, 0);
       pmkid_stream(ch);
     }else if(readString.substring(0,6)=="PKGRAB"){
