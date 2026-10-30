@@ -3948,15 +3948,35 @@ void karma_scene_on_exit(void* context) {
 #define SCRIPT_FILES_MAX 8
 #define SCRIPT_LINES_MAX 20
 #define SCRIPT_LINE_LEN 64
-static char script_names[SCRIPT_FILES_MAX][48];
+// On-demand (2026-10-30): script_names/script_lines were static .bss (384 + 1280 B) resident for the
+// whole app, for a feature used only in the Script list/run scenes. Allocated together on first use
+// (script_ensure) and freed in app_free. All access is on the one GUI/dispatcher thread, so no lock.
+static char (*script_names)[48] = NULL; // [SCRIPT_FILES_MAX][48] when allocated
 static int script_file_count = 0;
 static char script_name[48] = {0};
-static char script_lines[SCRIPT_LINES_MAX][SCRIPT_LINE_LEN];
+static char (*script_lines)[SCRIPT_LINE_LEN] = NULL; // [SCRIPT_LINES_MAX][SCRIPT_LINE_LEN] when allocated
 static int script_line_count = 0;
 static int script_pc = 0;
 static int script_wait = 0;
 static bool script_running = false;
 static char script_status[48] = {0};
+
+// Allocate the script buffers if not up yet. Returns false on low memory, leaving both NULL; callers
+// then keep *_count at 0, so the render/step loops (guarded by script_pc < script_line_count and the
+// submenu loop by script_file_count) touch nothing.
+static bool script_ensure(void) {
+    if(script_names && script_lines) return true;
+    if(!script_names) script_names = malloc(sizeof(script_names[0]) * SCRIPT_FILES_MAX);
+    if(!script_lines) script_lines = malloc(sizeof(script_lines[0]) * SCRIPT_LINES_MAX);
+    if(!script_names || !script_lines) {
+        free(script_names);
+        free(script_lines);
+        script_names = NULL;
+        script_lines = NULL;
+        return false;
+    }
+    return true;
+}
 
 static const char* SCRIPT_DEMO =
     "# petrel script - one board command per line, \"WAIT <secs>\" to pause, # = comment\n"
@@ -3983,6 +4003,10 @@ static void script_seed_demo(void) {
 }
 
 static void script_list_load(void) {
+    if(!script_ensure()) {
+        script_file_count = 0;
+        return;
+    }
     script_file_count = 0;
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, SCRIPT_DIR);
@@ -4013,9 +4037,12 @@ static void script_list_load(void) {
 
 // Load <name> into script_lines, trimming CR/LF and dropping blanks and comments.
 static bool script_load(const char* name) {
+    if(!script_ensure()) return false;
     char path[96];
     snprintf(path, sizeof(path), SCRIPT_DIR "/%s", name);
-    static char raw[SCRIPT_LINES_MAX * SCRIPT_LINE_LEN + SCRIPT_LINE_LEN];
+    // was a 1344 B static scratch; now scoped to this call (freed before every return below).
+    char* raw = malloc(SCRIPT_LINES_MAX * SCRIPT_LINE_LEN + SCRIPT_LINE_LEN);
+    if(!raw) return false;
     size_t n = 0;
     Storage* st = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(st);
@@ -4040,6 +4067,7 @@ static bool script_load(const char* name) {
         }
         i = j + 1;
     }
+    free(raw);
     return script_line_count > 0;
 }
 
@@ -4159,8 +4187,16 @@ void script_run_scene_on_exit(void* context) {
 // stops that recording and saves the fetched list as an F1 script - so a macro is produced simply
 // by using the app normally.
 #define REC_SCRIPT_MAX 20
-static char rec_script[REC_SCRIPT_MAX][48];
+// On-demand (2026-10-30): was 960 B static .bss for the macro recorder only; allocated when a
+// recording starts (rec_ensure) and freed in app_free. GUI/dispatcher thread only.
+static char (*rec_script)[48] = NULL; // [REC_SCRIPT_MAX][48] when allocated
 static int rec_script_n = 0;
+
+static bool rec_ensure(void) {
+    if(rec_script) return true;
+    rec_script = malloc(sizeof(rec_script[0]) * REC_SCRIPT_MAX);
+    return rec_script != NULL;
+}
 static bool rec_active = false;
 static char rec_status[48];
 
@@ -4221,10 +4257,14 @@ static void rec_scene_build(Petrel* app);
 static void rec_item_cb(void* context, uint32_t index) {
     Petrel* app = context;
     if(index == 0) {   // toggle record
-        rec_active = !rec_active;
-        rec_script_n = 0;
-        rec_status[0] = '\0';
-        uart_helper_send(app->uart_helper, rec_active ? "REC 1\n" : "REC 0\n", 6);
+        if(!rec_active && !rec_ensure()) { // turning on, but no memory for the buffer
+            snprintf(rec_status, sizeof(rec_status), "low memory");
+        } else {
+            rec_active = !rec_active;
+            rec_script_n = 0;
+            rec_status[0] = '\0';
+            uart_helper_send(app->uart_helper, rec_active ? "REC 1\n" : "REC 0\n", 6);
+        }
     } else if(index == 1) {   // fetch what the board holds
         uart_helper_send(app->uart_helper, "RECFETCH\n", 9);
     }
@@ -5967,7 +6007,7 @@ void uart_process_line(FuriString* line, void* context) {
         // F5: the board finished dumping the recording - save it as a runnable script.
         rec_save(app);
     } else if(strncmp(furi_string_get_cstr(line), "REC:", 4) == 0) {
-        if(rec_script_n < REC_SCRIPT_MAX) {
+        if(rec_script && rec_script_n < REC_SCRIPT_MAX) {
             snprintf(rec_script[rec_script_n], sizeof(rec_script[0]), "%s", furi_string_get_cstr(line) + 4);
             rec_script_n++;
         }
@@ -6383,6 +6423,13 @@ static void app_free(Petrel* app) {
     free(hs_lens);
     hs_frames = NULL;
     hs_lens = NULL;
+    // On-demand script/recorder buffers (script_ensure / rec_ensure); producers are gone by here.
+    free(script_names);
+    free(script_lines);
+    free(rec_script);
+    script_names = NULL;
+    script_lines = NULL;
+    rec_script = NULL;
     // Last, now that every producer is gone (all timers stopped above, the UART worker joined in
     // uart_helper_free, and the dispatcher's tick can no longer fire because its loop returned).
     // Stop the storage worker BEFORE anything else is torn down. Its queue is drained and freed
