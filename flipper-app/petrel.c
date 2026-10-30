@@ -794,7 +794,7 @@ typedef enum {
 #define PETREL_EVT_ANIM_TICK 0x2012
 // "Start AP" from the Create-AP list. The action used to run inline in the list's enter callback
 // (state commands + a scene switch, with four 150 ms sleeps between them).
-#define PETREL_EVT_AP_START 0x2013
+#define PETREL_EVT_AP_START 0x2015 // was 0x2013: collided with PETREL_EVT_POP -> Start popped to hub, never launched the AP
 // The board's capability string arrived - possibly late. Menus are built once in on_enter, so a
 // board that was silent at startup left the Tools screen showing "no board" forever.
 #define PETREL_EVT_REIDENTIFIED 0x2014
