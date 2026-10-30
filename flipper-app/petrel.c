@@ -521,7 +521,12 @@ static uint8_t scan_seen_idx[WIFI_MAX];   // per-list index de-duplication (GUI 
 
 // Called from any thread. Takes ownership of data on success; returns false (and the caller frees)
 // when the queue is full, so nothing ever blocks here.
-static bool storage_submit(const char* path, char* data, size_t len, bool append) {
+// quiet=true: on a full queue, drop silently (no user-facing status). Use it for the shot.hex
+// screen mirror, whose dropped frame is harmless (the next frame redraws) -- otherwise a mirror
+// frame losing the race for one of the 8 slots raised a spurious "save queue full" popup under
+// heavy screen churn (e.g. flipcap polling). Real data writers pass quiet=false so a genuine loss
+// still reports. The session-summary drop counter increments either way.
+static bool storage_submit(const char* path, char* data, size_t len, bool append, bool quiet) {
     if(!storage_mutex || !storage_run || !data) return false;
     diag(13, (uint32_t)len, append ? 1u : 0u);       // snapshot size offered to the worker
     bool ok = false;
@@ -536,10 +541,12 @@ static bool storage_submit(const char* path, char* data, size_t len, bool append
         ok = true;
     } else {
         storage_dropped++;
-        // 2026-10-29: a full queue was silent. Publish it through the same failure mechanism the
-        // worker uses so the popup reports the loss instead of only the session-summary counter.
-        snprintf(storage_status, sizeof(storage_status), "save queue full");
-        storage_fail_seq++;
+        if(!quiet) {
+            // 2026-10-29: a full queue was silent. Publish it through the same failure mechanism the
+            // worker uses so the popup reports the loss instead of only the session-summary counter.
+            snprintf(storage_status, sizeof(storage_status), "save queue full");
+            storage_fail_seq++;
+        }
     }
     furi_mutex_release(storage_mutex);
     return ok;
@@ -581,7 +588,7 @@ static void petrel_fb_callback(
         hex[o++] = H[data[i] & 0x0f];
     }
     hex[o++] = '\n';
-    if(!storage_submit(SHOT_HEX_PATH, hex, o, false)) free(hex);
+    if(!storage_submit(SHOT_HEX_PATH, hex, o, false, true)) free(hex);
 }
 
 // Synchronous, CONFIRMED write for audit evidence. The audit record must be able to state whether
@@ -943,7 +950,7 @@ static void hs_write_pcap(const char* path, uint16_t* out_frames, bool* out_save
             // out_frames reports what was QUEUED; the worker logs the real outcome (short write vs
             // saved) separately - see storage_status. A rejected submission queued nothing, so it
             // must not claim frames were written.
-            if(!storage_submit(path, snap, off, false)) { free(snap); written = 0; }
+            if(!storage_submit(path, snap, off, false, false)) { free(snap); written = 0; }
         }
     }
     if(out_frames) *out_frames = written;
@@ -1058,7 +1065,7 @@ static void audit_write_json(
     char* snap = malloc((size_t)n);
     if(snap) {
         memcpy(snap, buf, (size_t)n);
-        if(!storage_submit(apath, snap, (size_t)n, false)) free(snap);
+        if(!storage_submit(apath, snap, (size_t)n, false, false)) free(snap);
     }
     // Evidence pack: also drop a human-readable run report beside the machine-readable audit.json.
     char rpath[160];
@@ -1091,7 +1098,7 @@ static void audit_write_json(
     char* rsnap = malloc((size_t)rn);
     if(rsnap) {
         memcpy(rsnap, rbuf, (size_t)rn);
-        if(!storage_submit(rpath, rsnap, (size_t)rn, false)) free(rsnap);
+        if(!storage_submit(rpath, rsnap, (size_t)rn, false, false)) free(rsnap);
     }
     audit_mode = false;
 }
@@ -1171,7 +1178,7 @@ static bool write_wpa_file(bool confirm) {
         free(snap);
         return ok;
     }
-    if(!storage_submit(apath, snap, len, false)) free(snap);
+    if(!storage_submit(apath, snap, len, false, false)) free(snap);
     return false;
 }
 
@@ -1198,7 +1205,7 @@ static void creds_append_sd(const char* line) {
         memcpy(snap + n, line, llen);
         snap[n + llen] = '\n';
         // append=true -> the worker opens with FSOM_OPEN_APPEND, preserving the old semantics.
-        if(!storage_submit(apath, snap, total, true)) free(snap);
+        if(!storage_submit(apath, snap, total, true, false)) free(snap);
     }
 }
 
@@ -1244,7 +1251,7 @@ static void petrel_save_scan(const char* kind, const char* body) {
     if(snap) {
         memcpy(snap, hdr, (size_t)n);
         if(blen) memcpy(snap + n, body, blen);
-        if(!storage_submit(path, snap, total, false)) free(snap);   // queue full -> drop, no block
+        if(!storage_submit(path, snap, total, false, false)) free(snap);   // queue full -> drop, no block
     }
 }
 
@@ -3071,7 +3078,7 @@ static void petrel_settings_save(void) {
     char* snap = malloc((size_t)n);
     if(snap) {
         memcpy(snap, buf, (size_t)n);
-        if(!storage_submit("/ext/petrel/settings.txt", snap, (size_t)n, false)) free(snap);
+        if(!storage_submit("/ext/petrel/settings.txt", snap, (size_t)n, false, false)) free(snap);
     }
 }
 
